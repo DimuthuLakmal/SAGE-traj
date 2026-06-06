@@ -125,11 +125,7 @@ The launch configurations currently contain machine-specific absolute paths unde
 
 ## 3. Train the semantic goal predictor
 
-This stage corresponds to:
-
-```text
-Python Debugger: Train Goal Predictor
-```
+Download the pretrained multimodal checkpoint and set `MLLM_CKPT` to its path. This checkpoint is used to initialize the semantic goal predictor's multimodal encoder.
 
 ### Command
 
@@ -170,12 +166,6 @@ test -f "$GOAL_CKPT" && echo "Goal checkpoint found: $GOAL_CKPT"
 
 ## 4. Train the diffusion model with the semantic goal predictor
 
-This stage corresponds to:
-
-```text
-Python Debugger: Train DMMDiff with MLLM Goal Predictor
-```
-
 The selected goal-predictor checkpoint is loaded through `--policy_ckpt`, while `--policy_config_name` tells the training script which goal-predictor configuration to reconstruct.
 
 ### Command
@@ -203,12 +193,6 @@ export DIFF_CKPT_KEY=iter100000.ckpt
 ---
 
 ## 5. Run closed-loop simulation
-
-This stage corresponds to:
-
-```text
-Python Debugger: Scene Diffuser with MLLM Goal Predictor
-```
 
 ### Command
 
@@ -260,12 +244,6 @@ python scripts/scene_editor.py \
 ---
 
 ## 6. Parse and evaluate the closed-loop results
-
-This stage corresponds to:
-
-```text
-Python Debugger: Results
-```
 
 Set the rollout result directory and ground-truth histogram path:
 
