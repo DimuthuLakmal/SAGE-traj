@@ -108,6 +108,7 @@ All commands in this README use the following environment variable. Replace the 
 export NUSCENES_ROOT=/path/to/nuscenes
 ```
 
+Access MLLM checkpoint here: https://drive.google.com/drive/folders/1yAcjkOb4sHTzWkdi8qNp9Qo0NIdNCaEa?usp=sharing
 Run all subsequent commands from the SAGE-Traj repository root.
 
 You may also define convenient output locations:
