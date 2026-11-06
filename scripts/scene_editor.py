@@ -28,6 +28,70 @@ from tbsim.utils.tensor_utils import map_ndarray
 import tbsim.utils.tensor_utils as TensorUtils
 
 
+def _collect_modules(obj, seen=None, depth=0, max_depth=4):
+    """Recursively find all torch.nn.Module instances reachable from a (possibly wrapped) policy."""
+    if seen is None:
+        seen = set()
+    if id(obj) in seen or depth > max_depth:
+        return []
+    seen.add(id(obj))
+    if isinstance(obj, torch.nn.Module):
+        return [obj]
+    found = []
+    children = []
+    if isinstance(obj, (list, tuple, set)):
+        children = list(obj)
+    elif isinstance(obj, dict):
+        children = list(obj.values())
+    elif hasattr(obj, "__dict__"):
+        children = list(vars(obj).values())
+    for c in children:
+        if isinstance(c, (str, bytes, int, float, bool, np.ndarray, torch.Tensor)) or c is None:
+            continue
+        found.extend(_collect_modules(c, seen, depth + 1, max_depth))
+    return found
+
+
+def report_weight_memory(policy, mem_before, mem_after, peak_after):
+    """Print GPU memory consumed by model weights (parameters + buffers)."""
+    MB = 1024 ** 2
+    modules = _collect_modules(policy)
+    seen_ptrs = set()
+    totals = {"param_gpu": 0, "buffer_gpu": 0, "param_cpu": 0, "buffer_cpu": 0, "n_params": 0}
+    print("\n========== Model weight memory ==========")
+    for m in modules:
+        m_param, m_buf, m_n = 0, 0, 0
+        for kind, tensors in (("param", m.parameters()), ("buffer", m.buffers())):
+            for t in tensors:
+                key = (t.device, t.data_ptr())
+                if key in seen_ptrs:
+                    continue  # shared weights counted once
+                seen_ptrs.add(key)
+                nbytes = t.numel() * t.element_size()
+                loc = "gpu" if t.is_cuda else "cpu"
+                totals["{}_{}".format(kind, loc)] += nbytes
+                if kind == "param":
+                    m_param += nbytes
+                    m_n += t.numel()
+                else:
+                    m_buf += nbytes
+        totals["n_params"] += m_n
+        print("  {:<40s} params={:>12,d}  param_mem={:9.2f} MB  buffer_mem={:9.2f} MB".format(
+            type(m).__name__, m_n, m_param / MB, m_buf / MB))
+    print("  ---------------------------------------")
+    print("  Total parameters             : {:,d}".format(totals["n_params"]))
+    print("  Weights on GPU (params)      : {:.2f} MB".format(totals["param_gpu"] / MB))
+    print("  Weights on GPU (buffers)     : {:.2f} MB".format(totals["buffer_gpu"] / MB))
+    print("  Weights on GPU (total)       : {:.2f} MB".format((totals["param_gpu"] + totals["buffer_gpu"]) / MB))
+    if totals["param_cpu"] + totals["buffer_cpu"] > 0:
+        print("  Weights left on CPU          : {:.2f} MB".format((totals["param_cpu"] + totals["buffer_cpu"]) / MB))
+    if torch.cuda.is_available():
+        print("  CUDA allocated delta (load)  : {:.2f} MB".format((mem_after - mem_before) / MB))
+        print("  CUDA peak during load        : {:.2f} MB".format(peak_after / MB))
+        print("  CUDA reserved after load     : {:.2f} MB".format(torch.cuda.memory_reserved() / MB))
+    print("=========================================\n")
+
+
 def run_scene_editor(eval_cfg, save_cfg, data_to_disk, render_to_video, render_to_img, render_cfg):
     assert eval_cfg.env in ["nusc", "trajdata"], "Currently only nusc and trajdata environments are supported"
         
@@ -61,9 +125,18 @@ def run_scene_editor(eval_cfg, save_cfg, data_to_disk, render_to_video, render_t
     # create policy and rollout wrapper
     policy_composers = importlib.import_module("tbsim.evaluation.policy_composers")
     composer_class = getattr(policy_composers, eval_cfg.eval_class)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    mem_before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
     composer = composer_class(eval_cfg, device)
-    policy, exp_config = composer.get_policy(data_cache_dir='~/.unified_data_cache', load_mllm_goal_predictor=True)
-    
+    policy, exp_config = composer.get_policy(data_cache_dir='~/.unified_data_cache')
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    mem_after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    peak_after = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    report_weight_memory(policy, mem_before, mem_after, peak_after)
+
     # determines cfg for rasterizing agents
     set_global_trajdata_batch_raster_cfg(exp_config.env.rasterizer)
     

@@ -21,6 +21,7 @@ from .diffuser_helpers import (
     extract,
     apply_conditioning,
     Losses,
+    WeightedL2WithCollision,
     query_feature_grid,
     convert_state_to_state_and_action,
     unicyle_forward_dynamics,
@@ -111,10 +112,14 @@ class DiffuserModel(nn.Module):
 
             # NEW
             use_goal_conditioning=True,
-            goal_cond_dim=16,
-            # goal_cvae_config=None,
-            # llm_model=None,
-            # llm_tokenizer=None,
+            goal_cond_dim=64,
+            # number of history frames (evenly spaced, current frame included) fed to the raster encoder
+            hist_encoder_num_frames=8,
+            # goal predictor gRPC service (GOAL_SERVICE_ADDR env var overrides the address)
+            goal_service_address="localhost:50051",
+            goal_service_timeout=120.0,
+            # JSONL log of the target trajectory and service goal per sample (GOAL_LOG_PATH env var overrides)
+            goal_log_path=None,
 
             # Loss
             loss_decay_rates = {},
@@ -134,20 +139,11 @@ class DiffuserModel(nn.Module):
 
         self.rasterized_map = rasterized_map
         self.rasterized_hist = rasterized_hist
+        self.hist_encoder_num_frames = hist_encoder_num_frames
 
         # ---------------- NEW: goal CVAE conditioning ----------------
         self.use_goal_conditioning = use_goal_conditioning
         self.goal_cond_dim = goal_cond_dim
-
-        self.goal_cond_mlp = None
-        if self.use_goal_conditioning:
-            self.goal_cond_mlp = nn.Sequential(
-                nn.Linear(3, goal_cond_dim),  # sampled goal: x, y, yaw
-                nn.ReLU(inplace=True),
-                nn.Linear(goal_cond_dim, goal_cond_dim),
-                nn.ReLU(inplace=True),
-            )
-
         
         cond_in_feat_size = 0
         cond_out_feat_size = cond_feature_dim
@@ -277,14 +273,18 @@ class DiffuserModel(nn.Module):
         self.transition_dim = observation_dim + action_dim
         self.output_dim = output_dim
 
-        goal_cond_heapmap_dim = 128
         if self.use_goal_conditioning:
             final_cond_dim = cond_out_feat_size + goal_cond_dim
         else:
             final_cond_dim = cond_out_feat_size
 
+        # per-timestep (goal - position, valid) channels; needs positions in the diffuser input
+        self.use_goal_channels = self.use_goal_conditioning and diffuser_input_mode != 'action'
+
         if diffuser_model_arch == "TemporalMapUnet":
             transition_in_dim = self.transition_dim
+            if self.use_goal_channels:
+                transition_in_dim += 3
             if self.use_map_feat_grid and self.map_encoder is not None:
                 # will be appending map features to each step of trajectory
                 transition_in_dim += map_grid_feature_dim
@@ -368,13 +368,16 @@ class DiffuserModel(nn.Module):
         # --------------------------------------------------------------------------------------
 
         self.data_cache_dir = data_cache_dir
-
-
-    def set_policy(self, goal_cvae):
-        self.goal_cvae = base_models.SpatialPlannerGoalConditioner(goal_cvae, use_heatmap=True)
+        # Attribute name kept as goal_cvae for checkpoint key naming (ignore_prefixes in policy_composers)
+        self.goal_cvae = base_models.GoalServiceConditioner(
+            goal_feat_dim=goal_cond_dim,
+            address=goal_service_address,
+            timeout=goal_service_timeout,
+            log_path=goal_log_path,
+        )
 
     #------------------------------------------ guidance utils ------------------------------------------#
-    
+
     def set_guidance(self, guidance_config_list, example_batch=None):
         '''
         Instantiates test-time guidance functions using the list of configs (dicts) passed in.
@@ -500,7 +503,7 @@ class DiffuserModel(nn.Module):
         #
         map_grid_feat = map_grid_feat_non_cond = raster_from_agent = None
         if self.map_encoder is not None:
-            image_batch = data_batch["image_new"]
+            image_batch = self.select_hist_frames(data_batch["image_new"])
             map_global_feat = self.map_encoder(image_batch)
             if self.use_map_feat_global:
                 cond_feat_in = torch.cat([cond_feat_in, map_global_feat], dim=-1)
@@ -509,7 +512,7 @@ class DiffuserModel(nn.Module):
 
             if include_class_free_cond:
                 image_non_cond = torch.ones_like(image_batch) * self.cond_fill_value
-                map_global_feat_non_cond, map_grid_feat_non_cond = self.map_encoder(image_non_cond)
+                map_global_feat_non_cond = self.map_encoder(image_non_cond)
                 if self.use_map_feat_global:
                     non_cond_feat_in = torch.cat([non_cond_feat_in, map_global_feat_non_cond], dim=-1)
 
@@ -565,49 +568,31 @@ class DiffuserModel(nn.Module):
         if include_class_free_cond:
             non_cond_feat = self.process_cond_mlp(non_cond_feat_in)
 
-        sampled_goal = None
-        goal_cond_feat = None
+        goal_cond_feat = goal_scaled = goal_valid = None
 
-        # ---------------- NEW: CVAE goal conditioning ----------------
+        # ---------------- NEW: goal conditioning ----------------
         if self.use_goal_conditioning:
-            # Usually freeze CVAE and sample without gradients.
-            with torch.no_grad():
-                goal_out = self.goal_cvae(
-                    data_batch,
-                    num_goal_samples=1,
-                    mask_drivable=True,
-                )
-
-            goal = torch.cat([goal_out["goal_positions"], goal_out["goal_yaws"]], dim=-1)
-
-            # goal = torch.stack(data_batch["goals"], dim=0)
-
-            # goal_g, goal_avail = self.extract_goal_targets(data_batch)
-            # draw_goal_points_on_map(
-            #     data_batch=data_batch,
-            #     pred_goals=goal,
-            #     gt_goals=goal_g,
-            #     batch_idx=0,
-            #     sample_idx=0,
-            #     heat_map=None
-            # )
-
-            goal_cond_feat = self.goal_cond_mlp(goal.reshape(N, -1).float())
+            # The service goal carries no gradient; the goal encoder and null embedding on top of it are trained
+            goal_agent, goal_valid = self.goal_cvae.query(data_batch)
+            if data_batch.get("goal_drop_mask") is not None:
+                goal_valid = goal_valid & ~data_batch["goal_drop_mask"].to(goal_valid.device)
+            goal_scaled = self.scale_traj(goal_agent[:, None], [0, 1])[:, 0] * goal_valid[:, None]
+            goal_cond_feat = self.goal_cvae.encode(goal_scaled, goal_valid)
             cond_feat = torch.concat([goal_cond_feat, cond_feat], dim=-1)
 
-        # cond_feat = torch.cat([cond_feat, goal_cond_feat], dim=-1)
-        if include_class_free_cond and non_cond_feat is not None:
-            # For classifier-free non-conditional branch, zero out the goal feature.
-            zero_goal_feat = torch.zeros_like(goal_cond_feat)
-            non_cond_feat = torch.cat([non_cond_feat, zero_goal_feat], dim=-1)
+            if include_class_free_cond:
+                # non-conditional branch: same [goal, cond] order, with the null goal
+                non_cond_feat = torch.cat([self.goal_cvae.null_feat(N), non_cond_feat], dim=-1)
 
         # TBD: maybe add only necessary info from data_batch into aux_info
         aux_info = {
-            'cond_feat': cond_feat, 
+            'cond_feat': cond_feat,
             'curr_states': curr_states,
-            "sampled_goal": sampled_goal,
             "goal_cond_feat": goal_cond_feat,
         }
+        if self.use_goal_channels:
+            aux_info['goal_scaled'] = goal_scaled
+            aux_info['goal_valid'] = goal_valid[:, None].to(goal_scaled.dtype)
         if include_class_free_cond:
             aux_info['non_cond_feat'] = non_cond_feat
 
@@ -618,7 +603,29 @@ class DiffuserModel(nn.Module):
             aux_info['raster_from_agent'] = raster_from_agent
 
         return aux_info
-    
+
+    def select_hist_frames(self, image_seq):
+        '''
+        Evenly subsamples the history frames, always keeping the first and the current (last) one.
+        - image_seq : (B, T, C, H, W)
+        '''
+        T = image_seq.size(1)
+        if self.hist_encoder_num_frames is None or self.hist_encoder_num_frames >= T:
+            return image_seq
+        idx = torch.linspace(0, T - 1, self.hist_encoder_num_frames, device=image_seq.device).round().long()
+        return image_seq[:, idx]
+
+    def append_goal_channels(self, x, goal_scaled, goal_valid):
+        '''
+        Appends per-timestep (goal - position, valid) channels to the diffuser input.
+        - x : (B, T, D) scaled trajectory, positions at [..., :2]
+        - goal_scaled : (B, 2) goal in the same scaled space
+        - goal_valid : (B, 1) 1.0 where the goal is usable
+        '''
+        delta = (goal_scaled[:, None] - x[..., :2]) * goal_valid[:, None]
+        valid = goal_valid[:, None].expand(-1, x.size(1), -1)
+        return torch.cat([x, delta, valid], dim=-1)
+
     def query_map_feats(self, x, map_grid_feat, raster_from_agent):
         '''
         - x : (B, T, D)
@@ -897,9 +904,11 @@ class DiffuserModel(nn.Module):
             
         # model_prediction = self.model(x, cond, t_inp, aux_info)
         x_model_in = x
+        if self.use_goal_channels:
+            x_model_in = self.append_goal_channels(x, aux_info['goal_scaled'], aux_info['goal_valid'])
         if self.use_map_feat_grid and self.map_encoder is not None:
             # get features from map and append to the trajectory
-            map_feat_traj = self.query_map_feats(x_model_in.detach(),
+            map_feat_traj = self.query_map_feats(x.detach(),
                                                  aux_info['map_grid_feat'],
                                                  aux_info['raster_from_agent'])
             x_model_in = torch.cat([x_model_in, map_feat_traj], dim=-1)
@@ -917,13 +926,17 @@ class DiffuserModel(nn.Module):
             # aux_info_non_cond['map_feat'] = aux_info['map_feat_non_cond']
             # model_non_cond_prediction = self.model(x, cond, t_inp, aux_info_non_cond)
             x_model_non_cond_in = x
+            if self.use_goal_channels:
+                # unconditional branch has no goal
+                x_model_non_cond_in = self.append_goal_channels(x, torch.zeros_like(aux_info['goal_scaled']),
+                                                                torch.zeros_like(aux_info['goal_valid']))
             if self.use_map_feat_grid and self.map_encoder is not None:
                 # get features from map and append to the trajectory
-                map_feat_traj = self.query_map_feats(x_model_non_cond_in.detach(),
+                map_feat_traj = self.query_map_feats(x.detach(),
                                                     aux_info['map_grid_feat_non_cond'],
                                                     aux_info['raster_from_agent'])
                 x_model_non_cond_in = torch.cat([x_model_non_cond_in, map_feat_traj], dim=-1)
-            model_non_cond_prediction = self.model(x_model_non_cond_in, aux_info['non_cond_feat'], t_inp)
+            model_non_cond_prediction = self.model(x_model_non_cond_in, {'cond_feat': aux_info['non_cond_feat']}, t_inp)
 
 
             # and combine to get actual model prediction (in noise space as in original paper)
@@ -944,7 +957,8 @@ class DiffuserModel(nn.Module):
         # else:
         #     assert RuntimeError()
 
-        if self.disable_control_on_stationary:
+        # stationary_mask is None when no mask was given (e.g. validation sampling); x_recon[None] would select everything
+        if self.disable_control_on_stationary and self.stationary_mask is not None:
             if self.diffuser_input_mode == 'state_and_action':
                 inds = [4, 5]
             else:
@@ -1177,14 +1191,17 @@ class DiffuserModel(nn.Module):
             x_action_noisy = x_noisy[..., [4, 5]]
             x_noisy = self.convert_action_to_state_and_action(x_action_noisy, aux_info['curr_states'])
 
+        x_model_in = x_noisy
+        if self.use_goal_channels:
+            x_model_in = self.append_goal_channels(x_noisy, aux_info['goal_scaled'], aux_info['goal_valid'])
         if self.use_map_feat_grid and self.map_encoder is not None:
             # get features from map and append to the trajectory
             map_feat_traj = self.query_map_feats(x_noisy.detach(),
                                                  aux_info['map_grid_feat'],
                                                  aux_info['raster_from_agent'])
-            x_noisy = torch.cat([x_noisy, map_feat_traj], dim=-1)
+            x_model_in = torch.cat([x_model_in, map_feat_traj], dim=-1)
 
-        noise = self.model(x_noisy, aux_info, t_inp)
+        noise = self.model(x_model_in, aux_info, t_inp)
 
         # TODO should apply hard constraints here to noise
 
@@ -1205,12 +1222,32 @@ class DiffuserModel(nn.Module):
             x_recon_selected = x_recon_selected * data_batch['target_availabilities'][:, :self.horizon].unsqueeze(-1)
             x_start_selected = x_start_selected * data_batch['target_availabilities'][:, :self.horizon].unsqueeze(-1)
 
-        # loss, info = self.loss_fn(x_recon_selected, x_start_selected)
-
-        data_batch_for_guidance = extract_data_batch_for_guidance_pure_diff(data_batch.copy(), mode='training', data_cache_dir=self.data_cache_dir)
         x_recon_selected = x_recon_selected.unsqueeze(dim=1)
         x_start_selected = x_start_selected.unsqueeze(dim=1)
-        loss, info = self.loss_fn(x_recon_selected, x_start_selected, data_batch_for_guidance)
+
+        if not isinstance(self.loss_fn, WeightedL2WithCollision):
+            return self.loss_fn(x_recon_selected, x_start_selected)
+
+        if self.diffuser_input_mode not in ['state_and_action', 'state_and_action_no_dyn']:
+            # collision losses need the full (x, y, vel, yaw, acc, yawvel) state
+            if not getattr(self, '_warned_coll_input_mode', False):
+                print('DIFFUSER: collision losses need state input, skipping them for input mode %s' % self.diffuser_input_mode)
+                self._warned_coll_input_mode = True
+            return self.loss_fn(x_recon_selected, x_start_selected)
+
+        # only the fields the collision losses read (no vec map loading, no in-place edits of data_batch)
+        guid_keys = ['curr_speed', 'world_from_agent', 'scene_index', 'extent', 'drivable_map', 'raster_from_agent']
+        data_batch_for_guidance = {k: data_batch.get(k) for k in guid_keys}
+        if data_batch_for_guidance['scene_index'] is None:
+            data_batch_for_guidance['scene_index'] = data_batch['scene_ids']
+
+        # collision losses work in metres/radians: descale the full reconstruction (no availability mask,
+        # which would turn masked steps into fake positions after descaling)
+        coll_traj = self.descale_traj(x_recon).unsqueeze(dim=1)
+        # x_recon is mostly noise at large t, so weight the collision losses by the signal fraction of x_t
+        sample_weight = self.alphas_cumprod[t].to(coll_traj.dtype)
+        loss, info = self.loss_fn(x_recon_selected, x_start_selected, data_batch_for_guidance,
+                                  coll_traj=coll_traj, sample_weight=sample_weight)
 
         return loss, info
 

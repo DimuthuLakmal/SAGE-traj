@@ -93,6 +93,7 @@ def generate_text_from_sample(model, processor, sample, max_new_tokens=2048, dev
 
     return output_text[0]  # Return the first decoded output text
 
+
 def retrieve_llm_data(maps_root_dir, batch_hist_pos):
     # Process each pair of files
 

@@ -17,7 +17,6 @@ from tbsim.algos.algos import (
     SceneTreeTrafficModel,
     STRIVETrafficModel,
     SceneDiffuserTrafficModel,
-    MLLMSpatialPlanner
 )
 
 from tbsim.algos.multiagent_algos import (
@@ -58,11 +57,7 @@ def algo_factory(config: ExperimentConfig, modality_shapes: dict, data_cache_dir
             algo = TreeVAETrafficModel(algo_config=algo_config, modality_shapes=modality_shapes)
     elif algo_name == "bc_ec":
         algo = BehaviorCloningEC(algo_config=algo_config, modality_shapes=modality_shapes)
-    elif algo_name == "spatial_planner":
-        algo = MLLMSpatialPlanner(algo_config=algo_config, modality_shapes=modality_shapes)
-    elif algo_name == "bits_spatial_planner":
-        algo = SpatialPlanner(algo_config=algo_config, modality_shapes=modality_shapes)
-    elif algo_name == "l5_spatial_planner":
+    elif algo_name in ("spatial_planner", "bits_spatial_planner", "l5_spatial_planner"):
         algo = SpatialPlanner(algo_config=algo_config, modality_shapes=modality_shapes)
     elif algo_name == "occupancy":
         algo = OccupancyMetric(algo_config=algo_config, modality_shapes=modality_shapes)

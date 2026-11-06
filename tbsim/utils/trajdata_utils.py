@@ -33,12 +33,12 @@ from torch import Tensor
 from trajdata.visualization.vis import draw_map, draw_agent, draw_history
 import cv2
 from PIL import Image
-from tbsim.utils.internvl_utils import get_pixel_values
 
 import os
+import json
 
 # from tbsim.utils.vertex_ai_utils import retrieve_llm_data
-from tbsim.utils.qwen_utils import retrieve_llm_data
+# from tbsim.utils.qwen_utils import retrieve_llm_data
 
 full_keywords = ['image', 'target_positions', 'target_yaws', 'target_availabilities', 'history_positions', 'history_yaws', 'history_speeds', 'history_availabilities', 'curr_speed', 'centroid', 'yaw', 'type', 'extent', 'raster_from_agent', 'agent_from_raster', 'agent_from_world', 'world_from_agent', 'all_other_agents_curr_speed', 'all_other_agents_future_availability', 'all_other_agents_types', 'all_other_agents_extents', 'scene_index', 'all_other_agents_history_speeds', 'all_other_agents_history_availabilities', 'all_other_agents_history_availability', 'all_other_agents_history_positions', 'all_other_agents_future_positions', 'all_other_agents_history_yaws', 'all_other_agents_future_yaws', 'image']
 major_keywords = ["history_positions", "history_yaws", "history_speeds", "extent", "history_availabilities", "curr_speed", "target_positions", "target_yaws", "target_availabilities", "all_other_agents_extents", "all_other_agents_history_speeds", "all_other_agents_history_yaws", "all_other_agents_history_positions", "all_other_agents_history_availabilities", "maps", "image"]+["type", "all_other_agents_types", "agent_hist"]
@@ -52,6 +52,22 @@ guidance_keywords_training = ['map_names', 'curr_speed', 'history_positions', 'h
 # TODO: these global hacks are pretty ugly, should refactor so this isn't necessary
 BATCH_ENV = None
 BATCH_RASTER_CFG = None
+
+system_message = """You are a Vision Language Model specialized in interpreting map images and coordinate sequences. \nYou are provided with coordinate sequences of vehicles 
+in a tabular format.\nThe tabular data shows the movements of vehicles on this road segment captured in 20 time steps. Each row has both x and y coordinates recorded in each 
+time step, in the format of x1,y1,x2,y2,...,x20,y20|. | represents the line break. \nAfter the line with word 'Coordinates:', the ego vehicle movement whose future movements 
+are going to be predicted based on these historical observations and the road segment. The remaining rows have the movements of other vehicles on the road. \nIn some time steps, 
+both x and y values are 0, and they are noises. \nYou are additionally provided with four images corresponding to steps t=14,t=16,t=18, and t=20 of the observation sequence showing 
+movements of vehicles on the map.\nThe map is a 224*224 three color images of a road segment from bird eye view. Yellow lines represent white lane lines in roads. \nBlue color area 
+represent pavements and red area represents the road and sometimes, parking areas where vehicle can move. Sometimes vehicles are parked in black area.\nBlue color dot represents 
+the ego vehicle, and green dots represent other adjacent vehicles.\nWhen overlaying the coordinates on the map to understand movements, make sure that (0,0) coordinate starts from 
+the top left corner. \nConsidering these information, You need to estimate the x and y coordinates of the ego vehicle at t=72"""
+
+jsonl_file = '/data/gpfs/projects/punim2030/mllm/data/train_internvl_target_pred.jsonl'
+
+def append_to_jsonl(data: dict) -> None:
+    with open(jsonl_file, "a", encoding="utf-8") as file:
+        file.write(json.dumps(data) + "\n")
 
 # need this for get_drivable_region_map
 def set_global_trajdata_batch_env(batch_env):
@@ -184,34 +200,46 @@ def resize_and_draw_points(
     return final_image
 
 
-def generate_pixel_values(data, maps, resize=False, llm_config=None):
+def generate_goal_frames(data, maps, resize=False):
+    """
+    Renders the four goal predictor input frames (t14, t16, t18, t20) per sample: the map with the
+    ego drawn in blue and the other agents in green, as in the goal predictor's training data.
+
+    Returns:
+        uint8 tensor [B, 4, H, W, 3] (RGB) on the CPU
+    """
+
     all_b_data = []
     for b_data in data:
         all_t_data = []
         for t in range(0, 4):
             t_data = []
             for i in range (len(b_data)):
+                i_data = b_data[i][13:][t*2]  # Start from t=14 to t=20
                 if resize:
-                    t_data.append((int(b_data[i][t*2 + 1][0]/4), int(b_data[i][t*2 + 1][1]/4)))
+                    t_data.append((int(i_data[0]/4), int(i_data[1]/4)))
                 else:
-                    t_data.append((int(b_data[i][t*2 + 1][0]), int(b_data[i][t*2 + 1][1])))
+                    t_data.append((int(i_data[0]), int(i_data[1])))
 
             all_t_data.append(t_data)
         all_b_data.append(all_t_data)
 
-    pixel_values_b = []
     maps_np = maps.detach().cpu().numpy().copy()
+
+    all_images_t = []
     for b, b_data in enumerate(all_b_data):
-        images_t = []
-        for t in range(4):
-            result = resize_and_draw_points(maps_np[b], b_data[t], resize=resize)
-            result = Image.fromarray(result)
-            images_t.append(result)
+        # Generate the four individual images in memory
+        images_t = [resize_and_draw_points(maps_np[b], b_data[t], resize=resize) for t in range(4)]
+        all_images_t.append(np.stack(images_t))
 
-        pixel_values = get_pixel_values(images_t, llm_config)
-        pixel_values_b.append(pixel_values)
+    # # Save a 1 x 4 merged image per sample, the layout of the goal predictor's training images
+    # for i, images_t in enumerate(all_images_t):
+    #     Image.fromarray(np.concatenate(images_t, axis=1)).save(Path("./") / f"merged_{i}.png")
 
-    return pixel_values_b
+    if not all_images_t:
+        h, w = maps.shape[-2:]
+        return torch.zeros((0, 4, h, w, 3), dtype=torch.uint8)
+    return torch.from_numpy(np.stack(all_images_t))
 
 
 def rasterize_agents(
@@ -223,7 +251,6 @@ def rasterize_agents(
         raster_from_agent: torch.Tensor,
         map_res: torch.Tensor,
         reset,
-        llm_config
 ) -> torch.Tensor:
     """Paint agent histories onto an agent-centric map image"""
     b, a, t, _ = agent_hist_pos.shape
@@ -244,7 +271,8 @@ def rasterize_agents(
     raster_hist_pos[..., 1] = torch.where((hist_y >= 0.0) & (hist_y <= (h - 1)), hist_y, 0.0)
     raster_hist_pos = torch.round(raster_hist_pos).long()
 
-    all_batch_data_str = []
+    # Goal predictor coordinate table per sample: 'x1,y1,...,x20,y20|...|', ego row first
+    goal_coordinates = []
     all_batch_data = []
 
     for b_data in raster_hist_pos.permute(0,2,1,3):
@@ -253,20 +281,28 @@ def rasterize_agents(
         for n_data in b_data:
             all_t_data_str = ''
             all_t_data = []
-            for i, t_data in enumerate(n_data):
-                if i%4 == 0:
-                    all_t_data_str += (str(t_data[0].item()) + "," + str(t_data[1].item()) + ",")
-                    all_t_data.append((t_data[0].item(), t_data[1].item()))
+            for i, t_data in enumerate(n_data[-20:]):
+                all_t_data_str += (str(t_data[0].item()) + "," + str(t_data[1].item()) + ",")
+                all_t_data.append((t_data[0].item(), t_data[1].item()))
 
             all_t_data_str = all_t_data_str[:-1] + "|"
             all_n_data_str += all_t_data_str
             all_n_data.append(all_t_data)
 
-        all_n_data_str = 't4:<image>\n t8:<image>\n t12:<image>\n t16:<image>\nx1,y1,x2,y2,x3,y3,x4,y4,x5,y5,x6,y6,x7,y7,x8,y8|' + all_n_data_str
-        all_batch_data_str.append(all_n_data_str)
+        # The service adds the 't14:<image>\n ... Coordinates:\n' prefix and the system prompt itself
+        goal_coordinates.append(all_n_data_str)
         all_batch_data.append(all_n_data)
 
-    llm_images = generate_pixel_values(all_batch_data, maps, resize=False, llm_config=llm_config)
+    goal_frames = generate_goal_frames(all_batch_data, maps, resize=False)
+
+    #Create chat object
+    # all_chats = []
+    # for i in range(len(image_abs_paths)):
+    #     chat = {}
+    #     chat["image"] = image_abs_paths[i]
+    #     chat["conversations"] = [{"from": "system", "value": system_message}, {"from": "human", "value": all_batch_data_str[i]}]
+    #     all_chats.append(chat)
+
     # llm_images = None
     # all_batch_data_str = None
 
@@ -300,6 +336,10 @@ def rasterize_agents(
                         src=torch.ones((b, t, h * w, 1), device=maps.device) * white)  # mark other agents with -1
     maps_hist_.scatter_(dim=2, index=raster_hist_pos_flat[:, :, [0]].unsqueeze(dim=-1).repeat(1, 1, 1, 3),
                         src=torch.ones((b, t, h * w, 1), device=maps.device) * green)  # mark ego with 1.
+    # invalid / out-of-raster positions were mapped to pixel 0 (and the maximum index): restore the map there
+    maps_flat = maps.permute(0, 2, 3, 1).reshape(b, h * w, 3)
+    maps_hist_[:, :, 0] = maps_flat[:, None, 0]
+    maps_hist_[:, :, -1] = maps_flat[:, None, -1]
 
     hist_image_ = maps_hist_.reshape(b, t, h, w, 3).permute(0, 1, 4, 2, 3)
     # save_image(hist_image[0][15], 'maps_hist.png')
@@ -326,14 +366,12 @@ def rasterize_agents(
     hist_image[:, :, -1] = 0  # correct the maximum index caused by out of bound locations
 
     hist_image = hist_image.reshape(b, t, h, w)
-
     maps = torch.cat((hist_image, maps), dim=1) 
-
 
     raster_hist_pos[..., 0] = raster_hist_pos[..., 0] / (w-1)
     raster_hist_pos[..., 1] = raster_hist_pos[..., 1] / (h-1)
 
-    return maps, hist_image_, relative_dist, agent_hist_pos, all_batch_data, llm_images, all_batch_data_str
+    return maps, hist_image_, relative_dist, agent_hist_pos, all_batch_data, goal_frames, goal_coordinates
 
 
 def get_drivable_region_map(maps):
@@ -420,6 +458,7 @@ def maybe_pad_neighbor(batch):
         hist_pad = torch.zeros(b, a, hist_len - neigh_len, batch["neigh_hist_extents"].shape[-1], device=device).to(device)
         batch["neigh_hist_extents"] = torch.cat((hist_pad, batch["neigh_hist_extents"]), dim=2)
 
+
 def parse_scene_centric(batch: dict):
     num_agents = batch["num_agents"]
     fut_pos, fut_yaw, _, fut_mask = trajdata2posyawspeed(batch["agent_fut"])
@@ -445,10 +484,7 @@ def parse_scene_centric(batch: dict):
     agent_hist_extent = batch["agent_hist_extent"]
     agent_hist_extent[torch.isnan(agent_hist_extent)] = 0.
 
-
     centered_world_from_agent = torch.inverse(batch["centered_agent_from_world_tf"])
-
-
 
     # map-related
     if batch["maps"] is not None:
@@ -544,7 +580,7 @@ def convert_neigh_to_agent_relative(agent_hist_pos, raster_from_agent, agent_mas
     return raster_hist_pos
 
 
-def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=None):
+def parse_node_centric(batch: dict, overwrite_nan=True, reset=False):
     maybe_pad_neighbor(batch)
     fut_pos, fut_yaw, _, fut_mask = trajdata2posyawspeed(batch["agent_fut"], nan_to_zero=overwrite_nan)
     hist_pos, hist_yaw, hist_speed, hist_mask = trajdata2posyawspeed(batch["agent_hist"], nan_to_zero=overwrite_nan)
@@ -557,9 +593,6 @@ def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=
     assert torch.all(p1[~torch.isnan(p1)] == p2[~torch.isnan(p2)])
     curr_yaw = curr_state.heading[..., 0]
     curr_pos = curr_state.position
-
-    #goal
-    agent_goals = batch["agent_goals"]
 
     # convert nuscenes types to l5kit types
     agent_type = batch["agent_type"]
@@ -624,8 +657,9 @@ def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=
 
     # num_sem_layers = maps_rasterize_in.size(1)
 
+    goal_frames, goal_coordinates = None, None
     if BATCH_RASTER_CFG["include_hist"]:
-        maps, hist_maps, relative_xy, all_hist_pos, all_batch_data, llm_images, llm_text = rasterize_agents(
+        maps, hist_maps, relative_xy, all_hist_pos, all_batch_data, goal_frames, goal_coordinates = rasterize_agents(
             # batch['llm_input_ids'],
             maps_rasterize_in,
             all_hist_pos,
@@ -634,7 +668,6 @@ def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=
             raster_from_agent,
             map_res,
             reset,
-            llm_config
         )
 
     else:
@@ -648,6 +681,14 @@ def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=
     #     cur_layer = maps[0,li].cpu().numpy() # h, w
     #     plt.imshow(cur_layer)
     #     plt.show()
+
+    # Generating LLM training data
+    # fut_pos_ = transform_points_tensor(fut_pos, raster_from_agent)
+    # for i, chat in enumerate(all_chats):
+    #     target_goal = list(fut_pos_[i].detach().cpu().numpy()[-1])
+    #     target_goal_str = str(round(target_goal[0])) + "," + str(round(target_goal[1]))
+    #     chat["conversations"].append({"from": "gpt", "value": target_goal_str})
+    #     append_to_jsonl(chat)
 
     drivable_map = None
     if batch["maps"] is not None:
@@ -695,11 +736,10 @@ def parse_node_centric(batch: dict, overwrite_nan=True, reset=False, llm_config=
         all_other_agents_types=neigh_types,
         all_other_agents_extents=neigh_hist_extents.max(dim=-2)[0] * extent_scale,
         all_other_agents_history_extents=neigh_hist_extents * extent_scale,
-        llm_images=llm_images,
-        llm_text=llm_text,
+        goal_frames=goal_frames,
+        goal_coordinates=goal_coordinates,
         neigh_fut_pos_rel=neigh_fut_pos_rel,
-        scene_index = scene_index,
-        goals=agent_goals
+        scene_index = scene_index
     )
     if "agent_lanes" in batch:
         d["ego_lanes"] = batch["agent_lanes"]
@@ -736,25 +776,15 @@ def compute_valid_map_mask(batch_maps):
     return map_valid_mask
 
 @torch.no_grad()
-def parse_trajdata_batch(batch: dict, overwrite_nan=True, reset=False, llm_config=None):
+def parse_trajdata_batch(batch: dict, overwrite_nan=True, reset=False):
 
-    if llm_config is None:
-        llm_config = {
-            'dynamic_image_size': True,
-            'input_size': 224,
-            'use_thumbnail': True,
-            'max_num': 1,
-            'max_new_tokens': 8192,
-            'num_beams': 1
-        }
-    
     if "num_agents" in batch:
         # scene centric
         d = parse_scene_centric(batch)
         
     else:
         # agent centric
-        d = parse_node_centric(batch, overwrite_nan=overwrite_nan, reset=reset, llm_config=llm_config)
+        d = parse_node_centric(batch, overwrite_nan=overwrite_nan, reset=reset)
 
     batch = dict(batch)
     batch.update(d)

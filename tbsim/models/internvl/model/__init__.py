@@ -41,26 +41,38 @@ def split_model(model_name):
 
 
 def load_model_and_tokenizer(args):
-    if args['auto']:
-        config = InternVLChatConfig.from_pretrained(args['base_path'] if args['load_lora'] else args['checkpoint'])
+    if args.auto:
+        config = InternVLChatConfig.from_pretrained(args.base_path if args.load_lora else args.checkpoint)
         num_hidden_layers = config.llm_config.num_hidden_layers
-        # device_map = split_model('InternVL2_5-2B')
+        # device_map = split_model('InternVL2_5-26B')
         device_map = 'auto'
     kwargs = {
         # 'device_map': device_map,
-        'system_message': args['system_message']
-        } if args['auto'] else {}
-    tokenizer = AutoTokenizer.from_pretrained(args['checkpoint'], trust_remote_code=True, use_fast=False)
-
-    model = InternVLChatModel.from_pretrained(
-                    args['checkpoint'], low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
-                    load_in_8bit=False, load_in_4bit=False, **kwargs).eval()
-
-    for p in model.language_model.parameters():
-        p.requires_grad = False
-    for p in model.vision_model.parameters():
-        p.requires_grad = False
-    for p in model.mlp1.parameters():
-        p.requires_grad = False
-
+        'system_message': args.system_message
+        } if args.auto else {}
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True, use_fast=False)
+    # model = InternVLChatModel.from_pretrained(
+    #     args.checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
+    #     load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
+    if args.load_lora:
+        model = InternVLChatModel.from_pretrained(args.base_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, 
+        cache_dir="/data/gpfs/projects/punim2030/huggingface/cache", **kwargs)
+        model.language_model = PeftModel.from_pretrained(
+            model.language_model,
+            args.checkpoint + "/llm_lora",
+        )
+        model.vision_model = PeftModel.from_pretrained(
+            model.vision_model,
+            args.checkpoint + "/vision_lora",
+        )
+    else:
+        model = InternVLChatModel.from_pretrained(
+                    args.checkpoint, 
+                    low_cpu_mem_usage=True, 
+                    torch_dtype=torch.bfloat16,
+                    cache_dir="/data/gpfs/projects/punim2030/huggingface/cache",
+                    load_in_8bit=args.load_in_8bit, 
+                    load_in_4bit=args.load_in_4bit, **kwargs).eval()
+    if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
+        model = model.cuda()
     return model, tokenizer

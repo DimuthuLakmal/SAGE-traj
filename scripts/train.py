@@ -4,7 +4,7 @@ import os
 import socket
 import importlib
 
-import wandb
+# import wandb
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
@@ -61,9 +61,10 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
 
     # Training Parallelism
     cfg.train.parallel_strategy = "ddp"
-    cfg.devices.num_gpus = 4
-    # # cfg.train.parallel_strategy = "auto"
-    # # cfg.devices.num_gpus = 1
+    # NUM_GPUS lets a GPU on the node be left to the goal predictor service
+    cfg.devices.num_gpus = int(os.environ.get("NUM_GPUS", 4))
+    # cfg.train.parallel_strategy = "auto"
+    # cfg.devices.num_gpus = 1
     assert cfg.train.parallel_strategy in [
         "ddp",
         "ddp_spawn",
@@ -83,9 +84,6 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
             cfg.train.validation.batch_size = int(
                 cfg.train.validation.batch_size / cfg.devices.num_gpus
             )
-
-    if cfg.train.parallel_strategy == "ddp":
-        cfg.train.parallel_strategy = "ddp_find_unused_parameters_true"
 
     # Dataset
     datamodule = datamodule_factory(
@@ -110,7 +108,7 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
         policy_composers = importlib.import_module("tbsim.evaluation.policy_composers")
         composer_class = getattr(policy_composers, 'Diffuser')
         composer = composer_class(cfg, 'cuda')
-        model, exp_config = composer.get_policy(policy_wrapper=False)
+        model, exp_config = composer.get_policy(policy_wrapper=False, data_cache_dir=cfg.train.trajdata_cache_location)
         model.train()
     else:
         model = algo_factory(
@@ -126,6 +124,7 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
         # model, exp_config = composer.get_policy(policy_wrapper=False)
         # model.train()
         policy_config = get_registered_experiment_config(cfg.policy_config_name)
+        policy_config.algo.name='bits_spatial_planner'
         spatial_planner = load_goal_predictor(
             cfg=policy_config,
             checkpoint_path=cfg.policy_ckpt
@@ -134,22 +133,20 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
 
     # Checkpointing
     if cfg.train.validation.enabled and cfg.train.save.save_best_validation:
-        assert (
-            cfg.train.save.every_n_steps > cfg.train.validation.every_n_steps
-        ), "checkpointing frequency ("+str(cfg.train.save.every_n_steps)+") needs to be greater than validation frequency ("+str(cfg.train.validation.every_n_steps)+")"
         for metric_name, metric_key in model.checkpoint_monitor_keys.items():
             print(
                 "Monitoring metrics {} under alias {}".format(metric_key, metric_name)
             )
+            # checked right after each validation run (not on a step schedule), so the metric is always fresh
             ckpt_valid_callback = pl.callbacks.ModelCheckpoint(
                 dirpath=ckpt_dir,
-                filename="iter{step}_ep{epoch}_%s{%s:.2f}" % (metric_name, metric_key),
+                filename="iter{step}_ep{epoch}_%s{%s:.4f}" % (metric_name, metric_key),
                 # explicitly spell out metric names, otherwise PL parses '/' in metric names to directories
                 auto_insert_metric_name=False,
                 save_top_k=cfg.train.save.best_k,  # save the best k models
                 monitor=metric_key,
                 mode="min",
-                every_n_train_steps=cfg.train.save.every_n_steps,
+                save_on_train_epoch_end=False,
                 verbose=True,
             )
             train_callbacks.append(ckpt_valid_callback)
@@ -171,14 +168,16 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
         )
         train_callbacks.append(ckpt_rollout_callback)
 
-    # a ckpt monitor to save at fixed interval
+    # a ckpt monitor to save at fixed interval, keeping the latest two
+    # (ranked by step since lightning doesn't allow save_top_k > 1 with monitor=None)
     ckpt_fixed_callback = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="iter{step}",
         auto_insert_metric_name=False,
-        save_top_k=1,
-        monitor=None,
-        every_n_train_steps=5000,
+        save_top_k=2,
+        monitor="step",
+        mode="max",
+        every_n_train_steps=cfg.train.save.every_n_steps,
         verbose=True,
     )
     train_callbacks.append(ckpt_fixed_callback)
@@ -200,18 +199,18 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
             save_dir=root_dir, version=version_key, name=None, sub_dir="logs/"
         )
         print("Tensorboard event will be saved at {}".format(logger.log_dir))
-    elif cfg.train.logging.log_wandb:
-        assert (
-            "WANDB_APIKEY" in os.environ
-        ), "Set api key by `export WANDB_APIKEY=<your-apikey>`"
-        apikey = os.environ["WANDB_APIKEY"]
-        wandb.login(key=apikey)
-        logger = WandbLogger(
-            name=cfg.name, project=cfg.train.logging.wandb_project_name
-        )
-        # record the entire config on wandb
-        logger.experiment.config.update(cfg.to_dict())
-        logger.watch(model=model)
+    # elif cfg.train.logging.log_wandb:
+    #     assert (
+    #         "WANDB_APIKEY" in os.environ
+    #     ), "Set api key by `export WANDB_APIKEY=<your-apikey>`"
+    #     apikey = os.environ["WANDB_APIKEY"]
+    #     wandb.login(key=apikey)
+    #     logger = WandbLogger(
+    #         name=cfg.name, project=cfg.train.logging.wandb_project_name
+    #     )
+    #     # record the entire config on wandb
+    #     logger.experiment.config.update(cfg.to_dict())
+    #     logger.watch(model=model)
     else:
         print("WARNING: not logging training stats")
 
@@ -220,8 +219,6 @@ def main(cfg, auto_remove_exp_dir=False, debug=False, load_checkpoint=False, loa
     train_callbacks.append(lr_decay_callback)
 
     # Train
-    cfg.train.validation.every_n_steps = 5000
-    cfg.train.validation.batch_size = 16
     trainer = pl.Trainer(
         devices=cfg.devices.num_gpus,
         accelerator="gpu",
@@ -356,13 +353,6 @@ if __name__ == "__main__":
         "--debug", action="store_true", help="Debug mode, suppress wandb logging, etc."
     )
 
-    parser.add_argument(
-        "--mllm_checkpoint",
-        type=str,
-        default=None,
-        help="(optional) if provided, override the experiment name defined in the config",
-    )
-
     args = parser.parse_args()
 
     if args.config_name is not None:
@@ -405,10 +395,6 @@ if __name__ == "__main__":
         default_config.ckpt.policy.ngc_job_id = None
 
     default_config.train.on_ngc = args.on_ngc
-
-    # Add MLLM checkpoint path to config if provided
-    if args.mllm_checkpoint is not None:
-        default_config.algo.mllm_checkpoint = args.mllm_checkpoint
 
     if args.debug:
         # Test policy rollout

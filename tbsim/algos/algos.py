@@ -39,12 +39,6 @@ from tbsim.models.scenediffuser import SceneDiffuserModel
 from tbsim.utils.guidance_loss import choose_action_from_guidance, choose_action_from_gt
 from tbsim.utils.trajdata_utils import convert_scene_data_to_agent_coordinates,  add_scene_dim_to_agent_data, get_stationary_mask
 
-# llm model
-from tbsim.models.internvl.model import load_model_and_tokenizer
-
-#cvae goal predictor
-from tbsim.models.mllm_spatial_planner_models import MLLMGoalPredictor
-
 from tbsim.utils.logger import logger
 
 class BehaviorCloning(pl.LightningModule):
@@ -499,267 +493,6 @@ class SpatialPlanner(pl.LightningModule):
 
         return plan, dict(location_map=preds["location_map"], plan_samples=plan_samples, log_likelihood=preds["log_likelihood"])
 
-
-
-class MLLMSpatialPlanner(pl.LightningModule):
-    def __init__(self, algo_config, modality_shapes):
-        super(MLLMSpatialPlanner, self).__init__()
-        self.algo_config = algo_config
-        self.nets = nn.ModuleDict()
-
-        system_message = """You are a Vision Language Model specialized in interpreting map images and coordinate sequences. 
-You are provided with coordinate sequences of vehicles in a tabular format.
-The tabular data shows the movements of vehicles on this road segment captured on 8 time steps in a fixed frequency. Each row has both x and y coordinates recorded in each time step, in the format of x1,y1,x2,y2,...,x8,y8|. | represents the line break. 
-The first line of the tabular data has the column names and second line has the ego vehicle movement whose future movements are going to be predicted based on these historical observations and the road segment. The remaining rows have the movements of other vehicles on the road. 
-In some time steps, both x and y values are 0, and they are noises. 
-You are additionally provided with four images corresponding to steps t=4,t=8,t=12, and t=16 of the observation sequence showing movements of vehicles on the map.
-The map is a 56*56 three color images of a road segment from bird eye view. Yellow lines represent white lane lines in roads. 
-Blue color area represent pavements and red area represents the road and sometimes, parking areas where vehicle can move. Sometimes vehicles are parked in black area.
-Blue color dot represents the ego vehicle, and green dots represent other adjacent vehicles.
-Don't consider them in the analysis. When overlaying the coordinates on the map to understand movements, make sure that (0,0) coordinate starts from the top left corner. 
-Be very accurate when mention the directions and relative positions of vehicles. x values increase along the East, and y values increase along the South. You have to determine other directions accordingly.
-Considering these information, You need to generate a text describing the movement of the vehicles on the road, context of covering constraints and prominent road features like intersections, bends"""
-
-        llm_config = {'checkpoint': algo_config['mllm_checkpoint'],
-                      'auto': True,
-                      'system_message': system_message,
-                      'load_lora': False,
-                      'base_path': '',
-                    }
-
-        llm_model, llm_tokenizer = load_model_and_tokenizer(llm_config)
-        llm_model.to('cuda')
-
-        self.nets["policy"] = MLLMGoalPredictor(
-            mllm_hidden_dim=2048,
-            feat_dim=256,
-            attn_dim=128,
-            num_sections=4,
-            map_size=224,
-            dropout=0.1,
-            llm_model=llm_model, 
-            llm_tokenizer=llm_tokenizer,
-        )
-
-        self.validation_step_outputs = []
-        self.batch_i = 0
-
-    @property
-    def checkpoint_monitor_keys(self):
-        keys = {"posErr": "val/metrics_goal_pos_err"}
-        if self.algo_config.loss_weights.pixel_bce_loss > 0:
-            keys["valBCELoss"] = "val/losses_pixel_bce_loss"
-        if self.algo_config.loss_weights.pixel_ce_loss > 0:
-            keys["valCELoss"] = "val/losses_pixel_ce_loss"
-        return keys
-
-    def forward(self, obs_dict, mask_drivable=False, num_samples=None, clearance=None):
-        pred_map = self.nets["policy"](obs_dict)
-        return self.forward_prediction(
-            pred_map,
-            obs_dict,
-            mask_drivable=mask_drivable,
-            num_samples=num_samples,
-            clearance=clearance
-        )
-
-    @staticmethod
-    def forward_prediction(pred_map, obs_dict, mask_drivable=False, num_samples=None, clearance=None):
-        assert pred_map.shape[1] == 4  # [location_logits, residual_x, residual_y, yaw]
-
-        pred_map[:, 1:3] = torch.sigmoid(pred_map[:, 1:3])
-        location_map = pred_map[:, 0]
-
-        # get normalized probability map
-        location_prob_map = torch.softmax(location_map.flatten(1), dim=1).reshape(location_map.shape)
-
-        if mask_drivable:
-            # At test time: optionally mask out undrivable regions
-            if "drivable_map" not in obs_dict:
-                drivable_map = batch_utils().get_drivable_region_map(obs_dict["image"])
-            else:
-                drivable_map = obs_dict["drivable_map"]
-            for i, m in enumerate(drivable_map):
-                if m.sum() == 0:  # if nowhere is drivable, set it to all True's to avoid decoding problems
-                    drivable_map[i] = True
-
-            location_prob_map = location_prob_map * drivable_map.float()
-
-        # decode map as predictions
-        pixel_pred, res_pred, yaw_pred, pred_prob = AlgoUtils.decode_spatial_prediction(
-            prob_map=location_prob_map,
-            residual_yaw_map=pred_map[:, 1:],
-            num_samples=num_samples,
-            clearance = clearance,
-        )
-
-        # transform prediction to agent coordinate
-        pos_pred = transform_points_tensor(
-            (pixel_pred + res_pred),
-            obs_dict["agent_from_raster"].float()
-        )
-
-        return dict(
-            predictions=dict(
-                positions=pos_pred,
-                yaws=yaw_pred
-            ),
-            log_likelihood=torch.log(pred_prob),
-            spatial_prediction=pred_map,
-            location_map=location_map,
-            location_prob_map=location_prob_map
-        )
-
-    @staticmethod
-    def compute_metrics(pred_batch, data_batch):
-        metrics = dict()
-        goal_sup = data_batch["goal"]
-        goal_pred = TensorUtils.squeeze(pred_batch["predictions"], dim=1)
-
-        pos_norm_err = torch.norm(
-            goal_pred["positions"] - goal_sup["goal_position"], dim=-1
-        )
-        metrics["goal_pos_err"] = torch.mean(pos_norm_err)
-
-        metrics["goal_yaw_err"] = torch.mean(
-            torch.abs(goal_pred["yaws"] - goal_sup["goal_yaw"])
-        )
-
-        pixel_pred = torch.argmax(
-            torch.flatten(pred_batch["location_map"], start_dim=1), dim=1
-        )  # [B]
-        metrics["goal_selection_err"] = torch.mean(
-            (goal_sup["goal_position_pixel_flat"].long() != pixel_pred).float()
-        )
-        metrics["goal_cls_err"] = torch.mean((torch.exp(pred_batch["log_likelihood"]) < 0.5).float())
-        metrics = TensorUtils.to_numpy(metrics)
-        for k, v in metrics.items():
-            metrics[k] = float(v)
-        return metrics
-
-    @staticmethod
-    def compute_losses(pred_batch, data_batch):
-        losses = dict()
-        pred_map = pred_batch["spatial_prediction"]
-        b, c, h, w = pred_map.shape
-
-        goal_sup = data_batch["goal"]
-        # compute pixel classification loss
-        location_prediction = pred_map[:, 0]
-        losses["pixel_bce_loss"] = torch.binary_cross_entropy_with_logits(
-            input=location_prediction,  # [B, H, W]
-            target=goal_sup["goal_spatial_map"],  # [B, H, W]
-        ).mean()
-
-        losses["pixel_ce_loss"] = torch.nn.CrossEntropyLoss()(
-            input=location_prediction.flatten(start_dim=1),  # [B, H * W]
-            target=goal_sup["goal_position_pixel_flat"].long(),  # [B]
-        )
-
-        # compute residual and yaw loss
-        gather_inds = TensorUtils.unsqueeze_expand_at(
-            goal_sup["goal_position_pixel_flat"].long(), size=c, dim=1
-        )[..., None]  # -> [B, C, 1]
-
-        local_pred = torch.gather(
-            input=torch.flatten(pred_map, 2),  # [B, C, H * W]
-            dim=2,
-            index=gather_inds  # [B, C, 1]
-        ).squeeze(-1)  # -> [B, C]
-        residual_pred = local_pred[:, 1:3]
-        yaw_pred = local_pred[:, 3:4]
-        losses["pixel_res_loss"] = torch.nn.MSELoss()(residual_pred, goal_sup["goal_position_residual"])
-        losses["pixel_yaw_loss"] = torch.nn.MSELoss()(yaw_pred, goal_sup["goal_yaw"])
-
-        return losses
-
-    def training_step(self, batch, batch_idx):
-        batch = batch_utils().parse_batch(batch)
-        pout = self.forward(batch)
-        batch["goal"] = AlgoUtils.get_spatial_goal_supervision(batch)
-        losses = self.compute_losses(pout, batch)
-        total_loss = 0.0
-        for lk, l in losses.items():
-            loss = l * self.algo_config.loss_weights[lk]
-            self.log("train/losses_" + lk, loss)
-
-            if(self.batch_i % 50 == 0):
-                print("train/losses_" + lk, str(loss.detach().item()))
-
-            total_loss += loss
-
-        with torch.no_grad():
-            metrics = self.compute_metrics(pout, batch)
-        for mk, m in metrics.items():
-            self.log("train/metrics_" + mk, m)
-    
-        self.batch_i += 1
-
-        return total_loss
-
-    def validation_step(self, batch, batch_idx):
-        batch = batch_utils().parse_batch(batch)
-        pout = self(batch)
-        batch["goal"] = AlgoUtils.get_spatial_goal_supervision(batch)
-        losses = TensorUtils.detach(self.compute_losses(pout, batch))
-        metrics = self.compute_metrics(pout, batch)
-        return {"losses": losses, "metrics": metrics}
-
-    def on_validation_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0):
-        self.validation_step_outputs.append(outputs)
-
-    def on_validation_epoch_end(self):
-        outputs = self.validation_step_outputs
-
-        for k in outputs[0]["losses"]:
-            m = torch.stack([o["losses"][k] for o in outputs]).mean()
-            self.log("val/losses_" + k, m, sync_dist=True)
-
-        for k in outputs[0]["metrics"]:
-            m = np.stack([o["metrics"][k] for o in outputs]).mean()
-            self.log("val/metrics_" + k, m, sync_dist=True)
-
-        # Clear the stored outputs for next epoch
-        self.validation_step_outputs.clear()
-
-    def configure_optimizers(self):
-        optim_params = self.algo_config.optim_params["policy"]
-        return optim.Adam(
-            params=self.parameters(),
-            lr=optim_params["learning_rate"]["initial"],
-            weight_decay=optim_params["regularization"]["L2"],
-        )
-
-    def configure_optimizers(self):
-        optim_params = self.algo_config.optim_params["policy"]
-        return optim.Adam(
-            params=self.parameters(),
-            lr=optim_params["learning_rate"]["initial"],
-            weight_decay=optim_params["regularization"]["L2"],
-        )
-
-    def get_plan(self, obs_dict, mask_drivable=False, sample=False, num_plan_samples=1, clearance=None, **kwargs):
-        num_samples = num_plan_samples if sample else None
-        preds = self.forward(obs_dict, mask_drivable=mask_drivable, num_samples=num_samples,clearance=clearance)  # [B, num_sample, ...]
-        b, n = preds["predictions"]["positions"].shape[:2]
-        plan_dict = dict(
-            predictions=TensorUtils.unsqueeze(preds["predictions"], dim=1),  # [B, 1, num_sample...]
-            availabilities=torch.ones(b, 1, n).to(self.device),  # [B, 1, num_sample]
-        )
-        # pad plans to the same size as the future trajectories
-        n_steps_to_pad = self.algo_config.future_num_frames - 1
-        plan_dict = TensorUtils.pad_sequence(plan_dict, padding=(n_steps_to_pad, 0), batched=True, pad_values=0.)
-        plan_samples = Plan(
-            positions=plan_dict["predictions"]["positions"].permute(0, 2, 1, 3),  # [B, num_sample, T, 2]
-            yaws=plan_dict["predictions"]["yaws"].permute(0, 2, 1, 3),  # [B, num_sample, T, 1]
-            availabilities=plan_dict["availabilities"].permute(0, 2, 1)  # [B, num_sample, T]
-        )
-
-        # take the first sample as the plan
-        plan = TensorUtils.map_tensor(plan_samples.to_dict(), lambda x: x[:, 0])
-        plan = Plan.from_dict(plan)
-
-        return plan, dict(location_map=preds["location_map"], plan_samples=plan_samples, log_likelihood=preds["log_likelihood"])
 
 
 class VAETrafficModel(pl.LightningModule):
@@ -2007,6 +1740,11 @@ class DiffuserTrafficModel(pl.LightningModule):
             if self.cond_drop_neighbor_p > 0:
                 print('DIFFUSER: Dropping neighbor traj input conditioning with p = %f during training...' % (self.cond_drop_neighbor_p))
 
+        self.cond_drop_goal_p = algo_config.get("conditioning_drop_goal_p", 0.0)
+        assert 0.0 <= self.cond_drop_goal_p <= 1.0
+        if self.cond_drop_goal_p > 0:
+            print('DIFFUSER: Dropping goal conditioning with p = %f during training...' % (self.cond_drop_goal_p))
+
         self.nets["policy"] = DiffuserModel(
             rasterized_map=algo_config.rasterized_map,
             use_map_feat_global=algo_config.use_map_feat_global,
@@ -2063,7 +1801,13 @@ class DiffuserTrafficModel(pl.LightningModule):
 
             disable_control_on_stationary=self.disable_control_on_stationary,
             loss_decay_rates=algo_config.loss_decay_rates,
-            data_cache_dir=data_cache_dir
+            data_cache_dir=data_cache_dir,
+
+            goal_service_address=algo_config.get("goal_service_address", "localhost:50051"),
+            goal_service_timeout=algo_config.get("goal_service_timeout", 120.0),
+            goal_log_path=algo_config.get("goal_log_path", None),
+            goal_cond_dim=algo_config.get("goal_cond_dim", 64),
+            hist_encoder_num_frames=algo_config.get("hist_encoder_num_frames", 8),
         )
 
         # set up initial guidance and constraints
@@ -2083,14 +1827,10 @@ class DiffuserTrafficModel(pl.LightningModule):
             self.ema_start_step = algo_config.ema_start_step
             self.reset_parameters()
 
-        self.cur_train_step = 0
-
         self.losses = []
         self.validation_step_outputs = []
 
-
-    def set_policy(self, policy):
-        self.nets["policy"].set_policy(policy)
+        self.iter_i = []
 
     @property
     def checkpoint_monitor_keys(self):
@@ -2167,9 +1907,6 @@ class DiffuserTrafficModel(pl.LightningModule):
             return
         self.ema.update_model_average(self.ema_policy, self.nets["policy"])
 
-    def training_step_end(self, batch_parts):
-        self.cur_train_step += 1
-
     def training_step(self, batch, batch_idx):
         """
         Training on a single batch of data.
@@ -2185,15 +1922,20 @@ class DiffuserTrafficModel(pl.LightningModule):
             info (dict): dictionary of relevant inputs, outputs, and losses
                 that might be relevant for logging
         """
-        if self.use_ema and self.cur_train_step % self.ema_update_every == 0:
-            self.step_ema(self.cur_train_step)
+        # global_step (optimizer steps) also survives resuming; training_step_end is not called in Lightning 2.x
+        if self.use_ema and self.global_step % self.ema_update_every == 0:
+            self.step_ema(self.global_step)
         if self.data_centric is None:
             if "num_agents" in batch:
                 self.data_centric = 'scene'
             else:
                 self.data_centric = 'agent'
 
-        batch = batch_utils().parse_batch(batch)
+        if len(self.iter_i) != 0:
+            self.iter_i = [self.iter_i[-1] + 1 + i for i in range(batch['data_idx'].shape[0])]
+        else:
+            self.iter_i = [i for i in range(batch['data_idx'].shape[0])]
+        batch = batch_utils().parse_batch(batch, iter_i=self.iter_i)
 
         if self.data_centric == 'agent' and self.coordinate == 'agent_centric':
             pass
@@ -2204,26 +1946,18 @@ class DiffuserTrafficModel(pl.LightningModule):
 
         # drop out conditioning if desired
         if self.use_cond:
-            if self.use_rasterized_map:
-                num_sem_layers = batch['maps'].size(1) # NOTE: this assumes a trajdata-based loader. Will not work with lyft-specific loader.
-                if self.cond_drop_map_p > 0:
-                    drop_mask = torch.rand((batch["image"].size(0))) < self.cond_drop_map_p
-                    # only fill the last num_sem_layers as these correspond to semantic map
-                    batch["image"][drop_mask, -num_sem_layers:] = self.cond_fill_val
+            if self.use_rasterized_map or self.use_rasterized_hist:
+                # The model reads image_new, where map and agents share the same RGB frames, so map and
+                # history dropout can't be split by channel: drop the whole sequence, as in the non-cond branch
+                B = batch["image_new"].size(0)
+                drop_mask = torch.zeros(B, dtype=torch.bool)
+                if self.use_rasterized_map and self.cond_drop_map_p > 0:
+                    drop_mask |= torch.rand(B) < self.cond_drop_map_p
+                if self.use_rasterized_hist and self.cond_drop_neighbor_p > 0:
+                    drop_mask |= torch.rand(B) < self.cond_drop_neighbor_p
+                batch["image_new"][drop_mask.to(batch["image_new"].device)] = self.cond_fill_val
 
-            if self.use_rasterized_hist:
-                # drop layers of map corresponding to histories
-                # NOTE: this assumes a trajdata-based loader. Will not work with lyft-specific loader.
-                num_sem_layers = batch['maps'].size(1) if batch['maps'] is not None else None
-                if self.cond_drop_neighbor_p > 0:
-                    # sample different mask so sometimes both get dropped, sometimes only one
-                    drop_mask = torch.rand((batch["image"].size(0))) < self.cond_drop_neighbor_p
-                    if num_sem_layers is None:
-                        batch["image"][drop_mask] = self.cond_fill_val
-                    else:
-                        # only fill the layers before semantic map corresponding to trajectories (neighbors and ego)
-                        batch["image"][drop_mask, :-num_sem_layers] = self.cond_fill_val
-            else:
+            if not self.use_rasterized_hist:
                 if self.cond_drop_neighbor_p > 0:
                     # drop actual neighbor trajectories instead
                     # set availability to False, will be zeroed out in model
@@ -2231,15 +1965,20 @@ class DiffuserTrafficModel(pl.LightningModule):
                     drop_mask = torch.rand((B)) < self.cond_drop_neighbor_p
                     batch["all_other_agents_history_availabilities"][drop_mask] = 0
 
+        # dropped goals get the learned null goal embedding (trains the unconditional goal branch)
+        if self.cond_drop_goal_p > 0:
+            batch["goal_drop_mask"] = torch.rand(batch["history_positions"].size(0)) < self.cond_drop_goal_p
+
         # diffuser only take the data to estimate loss
         losses = self.nets["policy"].compute_losses(batch)
 
+        # "Diff Error" tracks the unweighted diffusion loss only, not the collision terms
+        if len(self.losses) % 200 == 0 and len(self.losses) > 0:
+            logger.info("Diff Error " + str(np.mean(np.array(self.losses))))
+        self.losses.append(losses["diffusion_loss"].detach().cpu().numpy())
+
         total_loss = 0.0
         for lk, l in losses.items():
-            if len(self.losses) % 200 == 0 and len(self.losses) > 0:
-                logger.info("Diff Error " + str(np.mean(np.array(self.losses))))
-            self.losses.append(l.detach().cpu().numpy())
-
             losses[lk] = l * self.algo_config.loss_weights[lk]
             total_loss += losses[lk]
 
@@ -2264,7 +2003,11 @@ class DiffuserTrafficModel(pl.LightningModule):
             else:
                 self.data_centric = 'agent'
 
-        batch = batch_utils().parse_batch(batch)
+        if len(self.iter_i) != 0:
+            self.iter_i = [self.iter_i[-1] + 1 + i for i in range(batch['data_idx'].shape[0])]
+        else:
+            self.iter_i = [i for i in range(batch['data_idx'].shape[0])]
+        batch = batch_utils().parse_batch(batch, iter_i=self.iter_i)
 
         if self.data_centric == 'agent' and self.coordinate == 'agent_centric':
             pass

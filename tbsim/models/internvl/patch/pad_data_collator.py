@@ -66,9 +66,9 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
         temp_input_ids = torch.LongTensor([pad_id] * max_item_length)
         temp_input_ids[:feat['input_ids'].shape[0]] = feat['input_ids']
         feat['input_ids'] = temp_input_ids
-        temp_labels = torch.LongTensor([IGNORE_INDEX] * max_item_length)
-        temp_labels[:feat['labels'].shape[0]] = feat['labels']
-        feat['labels'] = temp_labels
+        # temp_labels = torch.LongTensor([IGNORE_INDEX] * max_item_length)
+        # temp_labels[:feat['labels'].shape[0]] = feat['labels']
+        # feat['labels'] = temp_labels
         feat['attention_mask'] = feat['input_ids'].ne(pad_id)
 
         if 'position_ids' in feat:

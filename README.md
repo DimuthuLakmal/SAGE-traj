@@ -2,11 +2,21 @@
 
 SAGE-Traj is a vehicle trajectory generation framework that first predicts a high-level semantic goal and then conditions a diffusion model on that goal to generate realistic trajectories. The repository extends [CTG](https://github.com/NVlabs/CTG), which is built on [traffic-behavior-simulation (tbsim)](https://github.com/NVlabs/traffic-behavior-simulation). Its diffusion implementation also builds on [Diffuser](https://github.com/jannerm/diffuser), with optional STL-based guidance from [STLCG](https://github.com/StanfordASL/stlcg).
 
-This README describes the intended end-to-end workflow:
+## Architecture: goal inference service
 
-1. Train the semantic goal predictor.
-2. Train the diffusion trajectory generator using the trained goal predictor.
-3. Run closed-loop simulation with the trained diffusion model.
+The semantic goal predictor (a multimodal LLM with a goal head) is **not** part of this repository's model. It runs as a separate **goal inference service** that SAGE-Traj queries over gRPC. For every sample, SAGE-Traj renders the map frames and the coordinate table, sends them to the service, and conditions the diffusion model on the returned goal.
+
+- **Goal predictor service code:** `(https://github.com/DimuthuLakmal/goal_predictor_vllm.git)`
+
+The goal predictor is trained, and its checkpoint is served, from that repository. It has its own Python environment. This repository only contains the gRPC client (`tbsim/utils/goal_service/`).
+
+> **The goal inference service must be running before you start diffusion training or closed-loop simulation.** Both stages query it for every batch and wait for it to come up, up to a timeout.
+
+This README describes the end-to-end workflow:
+
+1. Start the goal inference service.
+2. Train the diffusion trajectory generator, conditioned on goals from the service, or download our pretrained checkpoint (Section 4.1).
+3. Run closed-loop simulation with the trained diffusion model, which also uses the service.
 4. Parse and evaluate the simulation results.
 
 The commands below are terminal equivalents of the corresponding configurations in `.vscode/launch.json`.
@@ -17,20 +27,26 @@ The commands below are terminal equivalents of the corresponding configurations 
 
 ### 1.1 Create the Python environment
 
-Python 3.9 is recommended because the repository and its upstream dependencies were developed against that version.
+Python 3.9 is required because the repository and its upstream dependencies were developed against that version.
 
 ```bash
 conda create -n bg3.9 python=3.9
 conda activate bg3.9
 ```
 
-### 1.2 Install this repository
+### 1.2 Install PyTorch
 
-Run the following from the repository root:
+The tested environment uses PyTorch 2.2.2 built for CUDA 11.8:
 
 ```bash
-pip install -e .
+pip install \
+  torch==2.2.2+cu118 \
+  torchvision==0.17.2+cu118 \
+  torchaudio==2.2.2+cu118 \
+  --extra-index-url https://download.pytorch.org/whl/cu118
 ```
+
+If your machine needs a different CUDA build, install the matching PyTorch 2.2.x wheels instead.
 
 ### 1.3 Install the customized `trajdata` dependency
 
@@ -45,9 +61,21 @@ pip install -e .
 cd ../SAGE-Traj
 ```
 
-Adjust the final `cd` command if your repository directory has a different name.
+Adjust the final `cd` command if your repository directory has a different name. The same applies to the steps below.
 
-### 1.4 Install the spline planner
+### 1.4 Install l5kit
+
+`tbsim` imports `l5kit` utilities, including on the nuScenes simulation path. l5kit declares old pins (`torch<2`, `numpy~=1.19`) that conflict with this environment, so install it without dependencies. Its runtime dependencies are covered by `requirements.txt`.
+
+```bash
+cd ..
+git clone https://github.com/woven-planet/l5kit.git
+cd l5kit/l5kit
+pip install --no-deps -e .
+cd ../../SAGE-Traj
+```
+
+### 1.5 Install the spline planner
 
 ```bash
 cd ..
@@ -57,7 +85,7 @@ pip install -e .
 cd ../SAGE-Traj
 ```
 
-### 1.5 Optional STLCG installation
+### 1.6 Optional STLCG installation
 
 Install this dependency when using STL/rule-based guidance.
 
@@ -71,23 +99,24 @@ pip install -e .
 cd ../SAGE-Traj
 ```
 
-### 1.6 Additional model dependencies
+### 1.7 Install the remaining dependencies and this repository
 
-The semantic module uses Hugging Face multimodal/model utilities. Ensure that the environment contains the compatible versions required by the checked-out code, including packages such as `transformers`, `accelerate`, `torch`, `torchvision`, and the remaining CTG/tbsim dependencies.
+`requirements.txt` was exported from the tested `bg3.9` environment. It leaves out the packages installed in the steps above. Install it **last**, because it intentionally overrides a few older pins from `trajdata_requirements.txt` (`pandas`, `tqdm`, `dill`, `pyarrow`). The header of the file lists what was left out and why.
 
-The original project may require the following legacy PyTorch stack, depending on the CUDA and upstream dependency versions used on the target machine:
+Run the following from the repository root:
 
 ```bash
-pip install \
-  torch==1.11.0+cu113 \
-  torchvision==0.12.0+cu113 \
-  torchaudio==0.11.0 \
-  torchmetrics==0.11.1 \
-  torchtext \
-  --extra-index-url https://download.pytorch.org/whl/cu113
+pip install -r requirements.txt
+pip install -e .
 ```
 
-Do not install this legacy stack blindly on a newer environment. Match PyTorch to the installed CUDA driver and verify compatibility with the repository's current `transformers` and Lightning code.
+### 1.8 Optional: flash-attn
+
+`flash-attn` is only used by the legacy in-repo InternVL modules (`tbsim/models/internvl`), and most of those imports are optional. It needs a CUDA toolchain to build, so it is not in `requirements.txt`. The tested environment uses:
+
+```bash
+pip install flash-attn==2.6.0.post1 --no-build-isolation
+```
 
 ---
 
@@ -108,78 +137,98 @@ All commands in this README use the following environment variable. Replace the 
 export NUSCENES_ROOT=/path/to/nuscenes
 ```
 
-Access MLLM checkpoint here: https://drive.google.com/drive/folders/1yAcjkOb4sHTzWkdi8qNp9Qo0NIdNCaEa?usp=sharing
 Run all subsequent commands from the SAGE-Traj repository root.
 
 You may also define convenient output locations:
 
 ```bash
-export GOAL_OUTPUT_DIR=$PWD/goal_predictor_trained_models
 export DIFF_OUTPUT_DIR=$PWD/diffuser_trained_models
 export RESULTS_ROOT=$PWD/sage_traj_results
-export MLLM_CKPT=/path/to/multimodal_checkpoint.ckpt
 ```
 
 The launch configurations currently contain machine-specific absolute paths under `/data/gpfs/...`. Replace those paths with paths valid on your machine when using VS Code.
 
 ---
 
-## 3. Train the semantic goal predictor
+## 3. Start the goal inference service
 
-Download the pretrained multimodal checkpoint and set `MLLM_CKPT` to its path. This checkpoint is used to initialize the semantic goal predictor's multimodal encoder.
+Set up, and if needed train, the goal predictor by following the instructions in the goal predictor service repository: `(https://github.com/DimuthuLakmal/goal_predictor_vllm.git)`.
+
+### 3.1 Launch the service
+
+Start the service in **its own environment** (not `bg3.9`), in a separate terminal, tmux session, or background job, and leave it running. With the reference implementation, run this from the service repository:
+
+```bash
+# In the goal predictor service repository and environment
+CUDA_VISIBLE_DEVICES=0 TOKENIZERS_PARALLELISM=false \
+  python -m internvl.inference.serve --config internvl/inference/configs/goal_predictor.yaml
+```
+
+See the service repository for the exact command, configuration file, and checkpoint path. By default the service listens on port `50051`.
+
+When the service and SAGE-Traj share a machine, give them different GPUs. For example, put the service on one GPU and train on the others with `CUDA_VISIBLE_DEVICES`.
+
+### 3.2 Point SAGE-Traj at the service
+
+SAGE-Traj connects to `localhost:50051` by default (`goal_service_address` in `tbsim/configs/algo_config.py`). If the service runs on another host or port, set:
+
+```bash
+export GOAL_SERVICE_ADDR=<host>:<port>   # e.g. gpu-node-12:50051
+```
+
+`GOAL_SERVICE_ADDR` overrides the configured address. The per-request timeout is `goal_service_timeout` (default 120 s).
+
+### 3.3 Check that the service is ready
+
+From the `bg3.9` environment, in the SAGE-Traj repository root:
+
+```bash
+python -c "
+from tbsim.utils.goal_service.client import get_client
+print('goal service ready:', get_client(timeout_seconds=1800).model_version)
+"
+```
+
+This blocks until the service answers its health check, up to the given timeout. Loading the model can take several minutes. Continue only once it prints the model version.
+
+### 3.4 SLURM example
+
+`scripts/train_goal_service.slurm` runs both processes in one job: it starts the service on one GPU, waits for the health check, and then trains on the remaining GPUs. The VS Code compound launch configuration `Goal Service: Server + Train Diffuser` does the same. Adjust the paths and environment names in both to match your machine.
+
+---
+
+## 4. Train the diffusion model
+
+Make sure the goal inference service is running and reachable (Section 3). The diffusion model gets its goal condition from the service during training, so there is no goal-predictor checkpoint to pass here.
 
 ### Command
 
 ```bash
 python scripts/train.py \
   --dataset_path "$NUSCENES_ROOT" \
-  --config_name trajdata_nusc_spatial_planner \
-  --output_dir "$GOAL_OUTPUT_DIR" \
-  --mllm_checkpoint "$MLLM_CKPT" \
+  --config_name trajdata_nusc_diff \
+  --output_dir "$DIFF_OUTPUT_DIR" \
   --debug
 ```
 
-Training creates versioned run directories. With the output path above, checkpoints will generally be stored in a structure similar to:
+For multi-GPU training, set `CUDA_VISIBLE_DEVICES` and `NUM_GPUS`, and keep the service's GPU out of `CUDA_VISIBLE_DEVICES`.
+
+To resume from a saved diffusion checkpoint, add:
+
+```bash
+--ckpt_dir "$DIFF_OUTPUT_DIR/test/run0" --ckpt_key iter60000.ckpt --load_checkpoint
+```
+
+Training creates versioned run directories, similar to:
 
 ```text
-goal_predictor_trained_models/
+diffuser_trained_models/
 └── test/
     └── run0/
         ├── checkpoints/
         │   └── iterXXXXX.ckpt
         ├── logs/
         └── videos/
-```
-
-The run number and checkpoint iteration depend on existing runs and training progress. Select the desired checkpoint before starting the next stage:
-
-```bash
-export GOAL_CKPT=$GOAL_OUTPUT_DIR/test/run0/checkpoints/iter50000.ckpt
-```
-
-Verify that it exists:
-
-```bash
-test -f "$GOAL_CKPT" && echo "Goal checkpoint found: $GOAL_CKPT"
-```
-
----
-
-## 4. Train the diffusion model with the semantic goal predictor
-
-The selected goal-predictor checkpoint is loaded through `--policy_ckpt`, while `--policy_config_name` tells the training script which goal-predictor configuration to reconstruct.
-
-### Command
-
-```bash
-python scripts/train_mllm_diff.py \
-  --dataset_path "$NUSCENES_ROOT" \
-  --config_name trajdata_nusc_diff \
-  --policy_ckpt "$GOAL_CKPT" \
-  --load_policy_checkpoint \
-  --policy_config_name trajdata_nusc_spatial_planner \
-  --output_dir "$DIFF_OUTPUT_DIR" \
-  --debug
 ```
 
 Select the trained diffusion checkpoint after training:
@@ -189,11 +238,37 @@ export DIFF_RUN_DIR=$DIFF_OUTPUT_DIR/test/run0
 export DIFF_CKPT_KEY=iter100000.ckpt
 ```
 
-> **Checkpoint directory note:** `scene_editor.py` receives a checkpoint directory and checkpoint filename separately. Depending on how the trained run is organized, `--policy_ckpt_dir` may need to be either the run directory or its `checkpoints` subdirectory. The checked-in launch configuration passes the run directory. Follow that convention first, and confirm that the repository's checkpoint resolver finds the requested key.
+> **Checkpoint directory note:** `scene_editor.py` receives a checkpoint directory (`--policy_ckpt_dir`) and a checkpoint key (`--policy_ckpt_key`) separately. Pass the **run directory**. The checkpoint resolver searches it recursively for exactly one `.ckpt` file whose name contains the key, and for the run's `config.json`. If the key matches more than one file (e.g. `iter8000` also matches `iter80000...`), loading fails, so use the full filename.
+
+### 4.1 Skip training: use the pretrained SAGE-Traj checkpoint
+
+To run closed-loop simulation without training, download our trained diffusion checkpoint:
+
+- **Pretrained SAGE-Traj checkpoint:** `<GOOGLE_DRIVE_LINK_TO_SAGE_TRAJ_CHECKPOINT>`
+
+The download contains the training `config.json` and the checkpoint file. Keep them in this layout:
+
+```text
+pretrained/sage_traj/
+├── config.json
+└── checkpoints/
+    └── <CHECKPOINT_FILENAME>.ckpt
+```
+
+Then point the simulation at it instead of a run you trained:
+
+```bash
+export DIFF_RUN_DIR=$PWD/pretrained/sage_traj
+export DIFF_CKPT_KEY=<CHECKPOINT_FILENAME>.ckpt
+```
+
+and continue with Section 5. You still need the goal inference service from Section 3: the pretrained diffusion model is conditioned on its goals and queries it during simulation.
 
 ---
 
 ## 5. Run closed-loop simulation
+
+The goal inference service must also be running during closed-loop simulation (Section 3), because the diffusion policy queries it for goals at every replanning step.
 
 ### Command
 
@@ -305,34 +380,38 @@ python scripts/parse_scene_edit_results.py \
 After setting `NUSCENES_ROOT`, the complete workflow is:
 
 ```bash
+# 0. In a separate terminal, using the goal predictor service repository and its environment,
+#    start the goal inference service and leave it running (see Section 3):
+#      (https://github.com/DimuthuLakmal/goal_predictor_vllm.git)
+#    If it is not on localhost:50051:
+# export GOAL_SERVICE_ADDR=<host>:<port>
+
+conda activate bg3.9
+
 # Output locations
-export GOAL_OUTPUT_DIR=$PWD/goal_predictor_trained_models
 export DIFF_OUTPUT_DIR=$PWD/diffuser_trained_models
 export RESULTS_ROOT=$PWD/sage_traj_results
 
-# 1. Train semantic goal predictor
+# 1. Wait until the goal inference service is ready
+python -c "
+from tbsim.utils.goal_service.client import get_client
+print('goal service ready:', get_client(timeout_seconds=1800).model_version)
+"
+
+# 2. Train the diffusion model (queries the goal service)
 python scripts/train.py \
   --dataset_path "$NUSCENES_ROOT" \
-  --config_name trajdata_nusc_spatial_planner \
-  --output_dir "$GOAL_OUTPUT_DIR"
-
-# Update these values after inspecting the generated run/checkpoints directory.
-export GOAL_CKPT=$GOAL_OUTPUT_DIR/test/run0/checkpoints/iter50000.ckpt
-
-# 2. Train diffusion model conditioned on the goal predictor
-python scripts/train_mllm_diff.py \
-  --dataset_path "$NUSCENES_ROOT" \
   --config_name trajdata_nusc_diff \
-  --policy_ckpt "$GOAL_CKPT" \
-  --load_policy_checkpoint \
-  --policy_config_name trajdata_nusc_spatial_planner \
   --output_dir "$DIFF_OUTPUT_DIR"
 
 # Update these values after inspecting the generated diffusion run.
 export DIFF_RUN_DIR=$DIFF_OUTPUT_DIR/test/run0
 export DIFF_CKPT_KEY=iter100000.ckpt
+# Or skip step 2 and use the pretrained checkpoint (Section 4.1):
+# export DIFF_RUN_DIR=$PWD/pretrained/sage_traj
+# export DIFF_CKPT_KEY=<CHECKPOINT_FILENAME>.ckpt
 
-# 3. Closed-loop simulation
+# 3. Closed-loop simulation (the goal service must still be running)
 python scripts/scene_editor.py \
   --results_root_dir "$RESULTS_ROOT" \
   --num_scenes_per_batch 1 \
@@ -354,5 +433,3 @@ python scripts/parse_scene_edit_results.py \
   --eval_out_dir "$ROLLOUT_DIR" \
   --gt_hist "$GT_HIST"
 ```
-
----

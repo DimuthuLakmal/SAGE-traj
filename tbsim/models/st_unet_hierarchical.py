@@ -247,10 +247,47 @@ class LightTemporalBlock(nn.Module):
         return out
 
 
+def sinusoidal_pos_2d(channels, h, w, device, dtype):
+    """Fixed 2D sinusoidal positional encoding: (channels, h, w), half the channels for y, half for x."""
+    quarter = channels // 4
+    freqs = 1.0 / (10000 ** (torch.arange(quarter, device=device, dtype=torch.float32) / max(quarter, 1)))
+    ys = torch.arange(h, device=device, dtype=torch.float32)[:, None] * freqs  # (h, quarter)
+    xs = torch.arange(w, device=device, dtype=torch.float32)[:, None] * freqs  # (w, quarter)
+    pos_y = torch.cat([ys.sin(), ys.cos()], dim=1).t()[:, :, None].expand(-1, h, w)  # (2*quarter, h, w)
+    pos_x = torch.cat([xs.sin(), xs.cos()], dim=1).t()[:, None, :].expand(-1, h, w)
+    pos = torch.cat([pos_y, pos_x], dim=0)
+    if pos.size(0) < channels:
+        pos = F.pad(pos, (0, 0, 0, 0, 0, channels - pos.size(0)))
+    return pos.to(dtype)
+
+
+class AttentionPool2d(nn.Module):
+    """
+    Pools a feature map with learned queries attending over all positions. A fixed positional
+    encoding is added to the keys/values, so the pooled vector keeps where things are relative to the ego.
+    """
+    def __init__(self, channels, num_queries=4, num_heads=4, out_dim=64):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(num_queries, channels) * channels ** -0.5)
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.proj = nn.Linear(channels, out_dim)
+        self.out_dim = num_queries * out_dim
+
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, num_queries * out_dim)
+        b, c, h, w = x.shape
+        x = x + sinusoidal_pos_2d(c, h, w, x.device, x.dtype)[None]
+        tokens = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        queries = self.queries[None].expand(b, -1, -1)
+        pooled, _ = self.attn(queries, tokens, tokens, need_weights=False)
+        return self.proj(pooled).flatten(1)
+
+
 class MultiScaleVectorHead(nn.Module):
     def __init__(self, in_dims, out_dim):
         super().__init__()
-        total_dim = sum(in_dims)
+        self.pools = nn.ModuleList([AttentionPool2d(c) for c in in_dims])
+        total_dim = sum(p.out_dim for p in self.pools)
 
         self.mlp = nn.Sequential(
             nn.Linear(total_dim, total_dim),
@@ -260,7 +297,7 @@ class MultiScaleVectorHead(nn.Module):
 
     def forward(self, feats):
         # feats: list of (B, C, H, W)
-        pooled = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feats]
+        pooled = [pool(f) for pool, f in zip(self.pools, feats)]
         x = torch.cat(pooled, dim=1)
         return self.mlp(x)
 
@@ -334,13 +371,6 @@ class STUNetTemporalPyramidEncoder(nn.Module):
             in_dims=fusion_dims,
             out_dim=global_feature_dim
         )
-
-        if global_feature_dim is not None:
-            self.global_head = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-                nn.Linear(fusion_dim, global_feature_dim),
-            )
 
     def forward(self, image_sequence: torch.Tensor, align_fn=None):
         if align_fn is not None:

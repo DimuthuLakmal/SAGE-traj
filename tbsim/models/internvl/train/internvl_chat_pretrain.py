@@ -452,7 +452,28 @@ class LazySupervisedDataset(Dataset):
         # Load the image using tcs_loader if available, otherwise use PIL
         if self.tcs_loader is not None and 's3://' in image_path:
             return self.tcs_loader(image_path)
-        return Image.open(image_path).convert('RGB')
+        
+        merged_image = Image.open(image_path).convert('RGB')
+        # Get full merged image size
+        merged_width, merged_height = merged_image.size
+
+        # Since it is a 1 x 4 image
+        single_width = merged_width // 4
+        single_height = merged_height
+
+        # Crop back into 4 original images
+        images_t = []
+
+        for t in range(4):
+            left = t * single_width
+            upper = 0
+            right = (t + 1) * single_width
+            lower = single_height
+
+            image_t = merged_image.crop((left, upper, right, lower))
+            images_t.append(image_t)
+
+        return images_t
 
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
@@ -529,12 +550,12 @@ class LazySupervisedDataset(Dataset):
 
         images, num_tiles = [], []
         num_image = len(data_item['image'])
-        for image_path in data_item['image']:
+        for i, image_path in enumerate(data_item['image']):
             # Merge the image path
             # image_path = self.get_image_path(image_path)
             image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)
+            image = self.load_image(image_path)[i]
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
                 image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
                                            max_num=max(1, self.max_dynamic_patch // num_image),

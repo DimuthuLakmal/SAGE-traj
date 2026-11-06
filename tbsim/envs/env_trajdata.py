@@ -452,21 +452,21 @@ class EnvUnifiedSimulation(BaseEnv, BatchedEnv):
             raw_obs.extend(scene.get_obs(collate=False))
 
         agent_obs = self.dataset.get_collate_fn(return_dict=True)(raw_obs)
-        # if not ((agent_obs['scene_ids'][0] == 'scene-0562') or (agent_obs['scene_ids'][0] == 'scene-0563') or
-        # (agent_obs['scene_ids'][0] == 'scene-0092') or (agent_obs['scene_ids'][0] == 'scene-0093') or
-        # (agent_obs['scene_ids'][0] == 'scene-0094') or (agent_obs['scene_ids'][0] == 'scene-0095') or
-        # (agent_obs['scene_ids'][0] == 'scene-0096') or (agent_obs['scene_ids'][0] == 'scene-0097') or
-        # (agent_obs['scene_ids'][0] == 'scene-0098') or (agent_obs['scene_ids'][0] == 'scene-0099') or
-        # (agent_obs['scene_ids'][0] == 'scene-0100') or (agent_obs['scene_ids'][0] == 'scene-0101') or
-        # (agent_obs['scene_ids'][0] == 'scene-0102') or (agent_obs['scene_ids'][0] == 'scene-0103') or
-        # (agent_obs['scene_ids'][0] == 'scene-0104') or (agent_obs['scene_ids'][0] == 'scene-0105') or
-        # (agent_obs['scene_ids'][0] == 'scene-0106') or (agent_obs['scene_ids'][0] == 'scene-0107') or
-        # (agent_obs['scene_ids'][0] == 'scene-0108') or (agent_obs['scene_ids'][0] == 'scene-0109')):
-        #     return None
-
-        if not (
-        (agent_obs['scene_ids'][0] == 'scene-0092') or (agent_obs['scene_ids'][0] == 'scene-0093') or (agent_obs['scene_ids'][0] == 'scene-0095') or (agent_obs['scene_ids'][0] == 'scene-0098')):
+        if not ((agent_obs['scene_ids'][0] == 'scene-0562') or (agent_obs['scene_ids'][0] == 'scene-0563') or
+        (agent_obs['scene_ids'][0] == 'scene-0092') or (agent_obs['scene_ids'][0] == 'scene-0093') or
+        (agent_obs['scene_ids'][0] == 'scene-0094') or (agent_obs['scene_ids'][0] == 'scene-0095') or
+        (agent_obs['scene_ids'][0] == 'scene-0096') or (agent_obs['scene_ids'][0] == 'scene-0097') or
+        (agent_obs['scene_ids'][0] == 'scene-0098') or (agent_obs['scene_ids'][0] == 'scene-0099') or
+        (agent_obs['scene_ids'][0] == 'scene-0100') or (agent_obs['scene_ids'][0] == 'scene-0101') or
+        (agent_obs['scene_ids'][0] == 'scene-0102') or (agent_obs['scene_ids'][0] == 'scene-0103') or
+        (agent_obs['scene_ids'][0] == 'scene-0104') or (agent_obs['scene_ids'][0] == 'scene-0105') or
+        (agent_obs['scene_ids'][0] == 'scene-0106') or (agent_obs['scene_ids'][0] == 'scene-0107') or
+        (agent_obs['scene_ids'][0] == 'scene-0108') or (agent_obs['scene_ids'][0] == 'scene-0109')):
             return None
+
+        # if not (
+        # (agent_obs['scene_ids'][0] == 'scene-0098') or (agent_obs['scene_ids'][0] == 'scene-0102')):
+        #     return None
 
         agent_obs = parse_trajdata_batch(agent_obs, overwrite_nan=False, reset=reset)
         agent_obs = TensorUtils.to_numpy(agent_obs,ignore_if_unspecified=True)

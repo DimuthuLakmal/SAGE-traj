@@ -1647,7 +1647,9 @@ class SceneDiffuserModel(nn.Module):
         if self.coordinate == 'agent_centric':
             # merge B and M to be compatible with guidance loss developed for agent-centric models
             data_batch_for_guidance = extract_data_batch_for_guidance(data_batch, mode='training')
-            loss, info = self.loss_fn(x_recon_selected, x_start_selected, data_batch_for_guidance)
+            # collision losses (if any) need unscaled states, not the scaled reconstruction
+            loss, info = self.loss_fn(x_recon_selected, x_start_selected, data_batch_for_guidance,
+                                      coll_traj=self.descale_traj(x_recon))
         else:
             loss, info = self.loss_fn(x_recon_selected, x_start_selected, {})
 

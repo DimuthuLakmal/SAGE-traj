@@ -6,6 +6,7 @@
 
 import warnings
 from typing import List, Optional, Tuple, Union
+import jsonlines
 
 import torch.distributed as dist
 import torch.utils.checkpoint
@@ -306,10 +307,6 @@ class InternVLChatModel(PreTrainedModel):
         # with torch.autocast(device_type="cuda", enabled=False):
         #     vit_embeds=self.mlp1(vit_embeds.float())
 
-        for param in next(self.mlp1.parameters()):
-            if(param.device == 'cpu'):
-                print('Found')
-            
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
@@ -342,7 +339,6 @@ class InternVLChatModel(PreTrainedModel):
             template.append_message(template.roles[1], None)
             query = template.get_prompt()
 
-            # image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token + IMG_END_TOKEN
             for num_patches in [1,1,1,1]:
                 image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
                 query = query.replace('<image>', image_tokens, 1)
@@ -412,7 +408,7 @@ class InternVLChatModel(PreTrainedModel):
             image_bs = pixel_values.shape[0]
             print(f'dynamic ViT batch size: {image_bs}')
 
-        for num_patches in num_patches_list:
+        for num_patches in [1,1,1,1]:
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
             query = query.replace('<image>', image_tokens, 1)
 
@@ -427,8 +423,19 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask=attention_mask,
             **generation_config
         )
+
+        scores = generation_output['scores']
+        probs = torch.stack([nn.functional.softmax(score, dim=-1) for score in scores]).squeeze()
+        all_top_logks, all_indices = torch.topk(probs, 10, dim=-1)
+        if save_logits:
+            save_logits_arr = []
+            for i, (word_top_logk, word_indice) in enumerate(zip(all_top_logks, all_indices)):
+                words_dict = {}
+                for j, (top_logk, indice) in enumerate(zip(word_top_logk, word_indice)):
+                    words_dict[indice.item()] = top_logk.item()
+                save_logits_arr.append(words_dict)
                 
-        hidden_states = generation_output["hidden_states"]
+        hidden_states = generation_output['hidden_states']
         generation_output = generation_output['sequences']
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep.strip())[0].strip()
@@ -440,7 +447,7 @@ class InternVLChatModel(PreTrainedModel):
             query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
             if verbose:
                 print(query_to_print, response)
-            return response, hidden_states
+            return response, save_logits_arr, hidden_states
 
     @torch.no_grad()
     def generate(

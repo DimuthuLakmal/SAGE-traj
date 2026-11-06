@@ -24,7 +24,7 @@
 #SBATCH --qos=feit
 
 # The amount of memory in megabytes per node:
-#SBATCH --mem=180000
+#SBATCH --mem=150000
 
 # Use this email address:
 #SBATCH --mail-user=dkariyawasan@student.unimelb.edu.au
@@ -38,7 +38,7 @@
 #SBATCH --mail-type=END
 
 # The maximum running time of the job in days-hours:mins:sec
-#SBATCH --time=1-00:0:00
+#SBATCH --time=2-00:0:00
 
 # check that the script is launched with sbatch
 if [ "x$SLURM_JOB_ID" == "x" ]; then
@@ -63,7 +63,7 @@ export PYTHONPATH="$PYTHONPATH:.";export CUDA_HOME="/apps/easybuild-2022/easybui
 # torchrun --nproc_per_node 4 scripts/train_lyft.py --dataset_path /data/gpfs/projects/punim2030/nuscenes --config_name trajdata_l5_spatial_planner --output_dir /data/gpfs/projects/punim2030/ctg/l5 --debug
 # python scripts/train_lyft.py --config_name trajdata_l5_diff --policy_ckpt /data/gpfs/projects/punim2030/ctg/l5/test/run2/checkpoints/iter240000.ckpt --load_policy_checkpoint --policy_config_name trajdata_l5_spatial_planner --debug
 # torchrun --nproc_per_node 4 scripts/precalculate_goals_fix.py --dataset_path /data/gpfs/projects/punim2030/nuscenes --config_name trajdata_nusc_spatial_planner --goal_ckpt /data/gpfs/projects/punim2030/ctg/test/run332/checkpoints/iter50000.ckpt --name mllm_goal_predictor --output_dir precalculated_goals/old
-python scripts/train_mllm_diff.py --dataset_path /data/gpfs/projects/punim2030/nuscenes --config_name trajdata_nusc_diff --policy_ckpt /data/gpfs/projects/punim2030/ctg/test/run332/checkpoints/iter50000.ckpt --load_policy_checkpoint --policy_config_name trajdata_nusc_spatial_planner --debug
+python scripts/train.py --dataset_path /data/gpfs/projects/punim2030/nuscenes --config_name trajdata_nusc_diff --debug
 
 ##DO NOT ADD/EDIT BEYOND THIS LINE##
 ##Job monitor command to list the resource usage

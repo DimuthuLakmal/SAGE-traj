@@ -13,13 +13,11 @@ from .diffuser_helpers import (
 
 import tbsim.utils.tensor_utils as TensorUtils
 
-from tbsim.models.transformer.unet_transformer_encoder import UnetTransformerEncoder
-
 class ResidualTemporalMapBlockConcat(nn.Module):
 
     def __init__(self, inp_channels, out_channels, time_embed_dim, horizon, kernel_size=5):
         super().__init__()
-        
+
         self.time_mlp = nn.Sequential(
             nn.Mish(),
             nn.Linear(time_embed_dim, out_channels),
@@ -41,8 +39,30 @@ class ResidualTemporalMapBlockConcat(nn.Module):
             returns:
             out : [ batch_size x out_channels x horizon ]
         '''
-        
+
         out = self.blocks[0](x) + self.time_mlp(t)
+        out = self.blocks[1](out)
+        return out + self.residual_conv(x)
+
+
+class ResidualTemporalMapBlockFiLM(ResidualTemporalMapBlockConcat):
+    '''
+    Same as ResidualTemporalMapBlockConcat, but the time/cond embedding gives a
+    per-channel scale and shift (FiLM) instead of an additive bias only.
+    '''
+
+    def __init__(self, inp_channels, out_channels, time_embed_dim, horizon, kernel_size=5):
+        super().__init__(inp_channels, out_channels, time_embed_dim, horizon, kernel_size)
+
+        self.time_mlp = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(time_embed_dim, out_channels * 2),
+            Rearrange('batch t -> batch t 1'),
+        )
+
+    def forward(self, x, t):
+        scale, shift = self.time_mlp(t).chunk(2, dim=1)
+        out = self.blocks[0](x) * (1 + scale) + shift
         out = self.blocks[1](out)
         return out + self.residual_conv(x)
 
@@ -65,6 +85,8 @@ class TemporalMapUnet(nn.Module):
 
         if diffuser_building_block == 'concat':
             ResidualTemporalMapBlock = ResidualTemporalMapBlockConcat
+        elif diffuser_building_block == 'film':
+            ResidualTemporalMapBlock = ResidualTemporalMapBlockFiLM
         else:
             raise NotImplementedError
         
@@ -121,12 +143,6 @@ class TemporalMapUnet(nn.Module):
             Conv1dBlock(final_up_dim, final_up_dim, kernel_size=5),
             nn.Conv1d(final_up_dim, output_dim, 1),
         )
-
-        self.encoder = UnetTransformerEncoder(dim_model=16,
-                                                num_heads=4,
-                                                num_encoder_layers=4,
-                                                dropout_p=0.1,
-                                                max_seq_len=horizon)
 
     def forward(self, x, aux_info, time):
         '''
@@ -186,5 +202,4 @@ class TemporalMapUnet(nn.Module):
         if len_x_shape == 4:
             x = x.reshape(BN, M, T, -1)
 
-        # x = self.encoder(x)
         return x

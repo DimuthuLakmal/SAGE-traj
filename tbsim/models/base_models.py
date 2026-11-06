@@ -18,6 +18,16 @@ import tbsim.utils.tensor_utils as TensorUtils
 import tbsim.dynamics as dynamics
 from tbsim.utils.guidance_loss import PerturbationGuidance
 
+import json
+import logging
+import os
+import time
+from tbsim.utils.goal_service.client import predict_goals, PIXEL_SIZE
+from tbsim.utils.geometry_utils import transform_points_tensor
+
+logger = logging.getLogger(__name__)
+
+
 class MLP(nn.Module):
     """
     Base class for simple Multi-Layer Perceptrons.
@@ -1480,111 +1490,140 @@ class MLPECTrajectoryDecoder(TrajectoryDecoder):
 
 
 
-class SpatialPlannerGoalConditioner(nn.Module):
+class GoalServiceConditioner(nn.Module):
     """
-    Uses CTG's SpatialPlanner / RasterizedMapUNet output as a condition
-    for the fine-grained trajectory diffusion model.
+    Goal condition for the trajectory diffusion model, predicted by the external goal predictor
+    gRPC service (InternVL + goal head, see tbsim/utils/goal_service).
 
-    The SpatialPlanner itself predicts:
-        positions: [B, M, 2]
-        yaws:      [B, M, 1]
-        log_likelihood: [B, M]
-        location_prob_map: [B, H, W]
+    Expects the data batch to carry, per sample:
+        goal_frames:      [B, 4, H, W, 3] uint8 map frames (t14, t16, t18, t20), see trajdata_utils.generate_goal_frames
+        goal_coordinates: the coordinate table 'x1,y1,...,x20,y20|...|', ego row first
+
+    The predicted goal is in the normalized [-1, 1] map space; query() converts it to the agent frame.
+    Samples without a usable goal (rejected, NaN, out of range, or dropped) get a learned null embedding,
+    so the model can tell them apart from real goals. Only the encoder and null embedding are trainable.
     """
+
+    # tolerance on the [-1, 1] range of the service reply
+    _NORM_RANGE_TOL = 1e-3
+
+    # Overrides the configured goal log path
+    LOG_PATH_ENV_VAR = 'GOAL_LOG_PATH'
 
     def __init__(
         self,
-        spatial_planner,
-        freeze_planner=True,
-        use_heatmap=False,
         goal_feat_dim=128,
+        address=None,
+        timeout=120.0,
+        num_fourier_freqs=8,
+        hidden_dim=128,
+        log_path=None,
     ):
         super().__init__()
 
-        self.spatial_planner = spatial_planner
-        self.freeze_planner = freeze_planner
-        self.use_heatmap = use_heatmap
+        # Only plain settings live on the module: the gRPC channel is cached per process in
+        # goal_service.client, so this module stays deepcopy-able (EMA) and picklable (DDP)
+        self.address = address
+        self.timeout = timeout
+        # JSONL file that gets the target trajectory and the service's goal per sample, None to disable
+        self.log_path = log_path
+
+        # log-spaced frequencies for the Fourier features of the (scaled) goal position
+        self.register_buffer('fourier_freqs', math.pi * 2.0 ** torch.arange(num_fourier_freqs, dtype=torch.float32))
+        fourier_dim = 2 + 2 * 2 * num_fourier_freqs  # raw xy + sin/cos per coordinate and frequency
 
         self.goal_encoder = nn.Sequential(
-            nn.Linear(4, 64),   # x, y, yaw, log_prob
+            nn.Linear(fourier_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(64, goal_feat_dim),
-            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, goal_feat_dim),
+        )
+        self.null_goal = nn.Parameter(torch.zeros(goal_feat_dim))
+
+    def query(self, obs_dict):
+        """
+        Queries the goal service for the batch.
+
+        Returns:
+            goal_agent: [B, 2] goal position in the agent frame (meters), 0 where invalid
+            valid:      [B] bool, False for rejected, non-finite or out-of-range replies
+        """
+        goal_xy_norm, ok, errors = predict_goals(
+            obs_dict["goal_frames"], obs_dict["goal_coordinates"],
+            address=self.address, timeout_seconds=self.timeout,
         )
 
-        if self.use_heatmap:
-            self.heatmap_encoder = nn.Sequential(
-                nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(32, goal_feat_dim),
-                nn.ReLU(inplace=True),
-            )
-        else:
-            self.heatmap_encoder = None
+        finite = np.isfinite(goal_xy_norm).all(axis=-1)
+        in_range = finite & (np.abs(np.nan_to_num(goal_xy_norm, nan=np.inf)) <= 1.0 + self._NORM_RANGE_TOL).all(axis=-1)
+        valid = ok & in_range
+        if not valid.all():
+            first = next(iter(errors.items()), (None, 'missing from the response'))
+            logger.warning('Goal service: %d/%d samples without a usable goal (rejected %d, non-finite %d, '
+                           'out of range %d), using the null goal (e.g. sample %s: %s)',
+                           int((~valid).sum()), len(valid), int((~ok).sum()), int((ok & ~finite).sum()),
+                           int((ok & finite & ~in_range).sum()), first[0], first[1])
+        raw_goal_xy_norm = goal_xy_norm
+        goal_xy_norm = np.where(valid[:, None], goal_xy_norm, 0.0).astype(np.float32)
 
-    def forward(
-        self,
-        obs_dict,
-        num_goal_samples=1,
-        mask_drivable=True,
-        clearance=None,
-    ):
+        agent_from_raster = obs_dict["agent_from_raster"]
+        device = agent_from_raster.device
+        goal_px = (torch.from_numpy(goal_xy_norm).to(device) + 1.0) / 2.0 * (PIXEL_SIZE - 1)
+        goal_agent = transform_points_tensor(goal_px[:, None].to(agent_from_raster.dtype), agent_from_raster)[:, 0]
+        valid = torch.from_numpy(valid).to(device)
+        goal_agent = goal_agent * valid[:, None]
+
+        log_path = os.environ.get(self.LOG_PATH_ENV_VAR) or self.log_path
+        if log_path:
+            try:
+                self._log_goals(log_path, obs_dict, raw_goal_xy_norm)
+            except Exception:
+                logger.exception('Goal service: failed to write the goal log to %s', log_path)
+
+        return goal_agent, valid
+
+    @staticmethod
+    def _log_goals(log_path, obs_dict, goal_xy_norm):
         """
+        Appends one JSON line per sample with the service's goal (goal_px) and the last target point
+        at the horizon (target_px), both in raster pixels. Either is null when non-finite / unavailable.
+        Under DDP each rank writes its own '.rank<N>' file.
+        """
+        if torch.distributed.is_available() and torch.distributed.is_initialized() \
+                and torch.distributed.get_world_size() > 1:
+            log_path = f'{log_path}.rank{torch.distributed.get_rank()}'
+
+        # last (horizon) target point, agent frame (meters) -> raster pixels
+        agent_from_raster = obs_dict["agent_from_raster"]
+        raster_from_agent = torch.linalg.inv(agent_from_raster.float())
+        last_target = obs_dict["target_positions"][:, -1:, :2].to(raster_from_agent)
+        target_px = transform_points_tensor(last_target, raster_from_agent)[:, 0].detach().cpu().numpy()
+        target_avail = obs_dict["target_availabilities"][:, -1].detach().cpu().numpy().astype(bool)
+
+        lines = []
+        for i in range(len(goal_xy_norm)):
+            goal_norm = goal_xy_norm[i]
+            record = {
+                'goal_px': [float((v + 1.0) / 2.0 * (PIXEL_SIZE - 1)) for v in goal_norm]
+                           if np.isfinite(goal_norm).all() else None,
+                'target_px': [float(v) for v in target_px[i]] if target_avail[i] else None,
+            }
+            lines.append(json.dumps(record))
+
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        with open(log_path, 'a') as f:
+            f.write('\n'.join(lines) + '\n')
+
+    def encode(self, goal_scaled, valid):
+        """
+        Args:
+            goal_scaled: [B, 2] goal in the diffuser's normalized position space
+            valid:       [B] bool
         Returns:
-            goal_cond: dict containing sampled goal tensors and encoded features.
+            goal_feat: [B, goal_feat_dim], the null embedding where not valid
         """
+        proj = goal_scaled[..., None] * self.fourier_freqs  # [B, 2, F]
+        fourier = torch.cat([goal_scaled, torch.sin(proj).flatten(1), torch.cos(proj).flatten(1)], dim=-1)
+        goal_feat = self.goal_encoder(fourier)
+        return torch.where(valid[:, None], goal_feat, self.null_feat(goal_feat.size(0)))
 
-        if self.freeze_planner:
-            self.spatial_planner.eval()
-            with torch.no_grad():
-                planner_out = self.spatial_planner.forward(
-                    obs_dict,
-                    mask_drivable=mask_drivable,
-                    num_samples=num_goal_samples,
-                    clearance=clearance,
-                )
-        else:
-            planner_out = self.spatial_planner.forward(
-                obs_dict,
-                mask_drivable=mask_drivable,
-                num_samples=num_goal_samples,
-                clearance=clearance,
-            )
-
-        goal_pos = planner_out["predictions"]["positions"]  # [B, M, 2]
-        goal_yaw = planner_out["predictions"]["yaws"]       # [B, M, 1]
-        goal_logp = planner_out["log_likelihood"]           # [B, M]
-
-        if goal_logp.ndim == 2:
-            goal_logp = goal_logp.unsqueeze(-1)              # [B, M, 1]
-
-        goal_input = torch.cat(
-            [goal_pos, goal_yaw, goal_logp],
-            dim=-1,
-        )  # [B, M, 4]
-
-        B, M, D = goal_input.shape
-
-        goal_feat = self.goal_encoder(
-            goal_input.reshape(B * M, D)
-        ).reshape(B, M, -1)  # [B, M, D_goal]
-
-        out = {
-            "planner_out": planner_out,
-            "goal_positions": goal_pos,
-            "goal_yaws": goal_yaw,
-            "goal_logp": goal_logp,
-            "goal_feat": goal_feat,
-        }
-
-        if self.use_heatmap:
-            heatmap = planner_out["location_prob_map"].unsqueeze(1)  # [B, 1, H, W]
-            heatmap_feat = self.heatmap_encoder(heatmap)             # [B, D_goal]
-            out["goal_heatmap"] = heatmap
-            out["goal_heatmap_feat"] = heatmap_feat
-
-        return out
+    def null_feat(self, n):
+        return self.null_goal[None].expand(n, -1)

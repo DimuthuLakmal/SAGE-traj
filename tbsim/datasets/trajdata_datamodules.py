@@ -171,7 +171,7 @@ class PassUnifiedDataModule(pl.LightningDataModule):
             standardize_data=data_cfg.trajdata_standardize_data,
             verbose=True,
             max_agent_num = max_agent_num,
-            num_workers=0,
+            num_workers=os.cpu_count(),
             rebuild_cache=data_cfg.trajdata_rebuild_cache,
             rebuild_maps=data_cfg.trajdata_rebuild_cache,
             # A dictionary that contains functions that generate our custom data.

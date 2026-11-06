@@ -29,18 +29,19 @@ class NuscTrajdataTrainConfig(TrajdataTrainConfig):
 
         # training config
         # assuming 1 sec (10 steps) past, 2 sec (20 steps) future
-        self.training.batch_size = 16  # 4 # 100
-        self.training.num_steps = 200000
-        self.training.num_data_workers = 0
+        self.training.batch_size = 8  # 4 # 100
+        self.training.num_steps = 120000
+        self.training.num_data_workers = 8
 
-        self.save.every_n_steps = 1000
-        self.save.best_k = 10
+        # periodic checkpoints keep the latest two; the best-validation one is kept separately
+        self.save.every_n_steps = 5000
+        self.save.best_k = 1
 
         # validation config
-        self.validation.enabled = False
+        self.validation.enabled = True
         self.validation.batch_size = 16  # 4 # 32
-        self.validation.num_data_workers = 0
-        self.validation.every_n_steps = 4000
+        self.validation.num_data_workers = 6
+        self.validation.every_n_steps = 5000
         self.validation.num_steps_per_epoch = 5  # 50
 
         self.on_ngc = False

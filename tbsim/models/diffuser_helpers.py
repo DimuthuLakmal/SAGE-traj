@@ -818,12 +818,13 @@ class WeightedLoss(nn.Module):
         self.register_buffer('weights', weights)
         self.action_dim = action_dim
 
-    def forward(self, pred, targ, data_batch={}):
+    def forward(self, pred, targ, data_batch={}, **kwargs):
         '''
         Note:
             Support both agent-centric and scene-centric (extra dimension for the inputs).
             pred, targ : tensor
                 [ B, (M), T, transition_dim ]
+            kwargs (e.g. coll_traj, sample_weight) are only used by the collision losses
         '''
         loss = self._loss(pred, targ)
         weighted_loss = (loss * self.weights).mean()
@@ -883,30 +884,39 @@ class WeightedL2WithCollision(WeightedLoss):
         self.agent_collision_loss_fn = AgentCollisionLoss(num_disks=2, buffer_dist=0.2, decay_rate=loss_decay_rates['collision_decay_rate'])
         self.map_collision_loss_fn = MapCollisionLoss(num_points_lw=(10, 10), decay_rate=loss_decay_rates['offroad_decay_rate'])
 
-    def forward(self, pred, targ, data_batch={}):
+    def forward(self, pred, targ, data_batch=None, coll_traj=None, sample_weight=None):
         '''
         Note:
             Support both agent-centric and scene-centric (extra dimension for the inputs).
             pred, targ : tensor
-                [ B, (M), T, transition_dim ]
+                [ B, (M), T, transition_dim ] in the scaled space, used for the reconstruction loss
+            coll_traj : tensor
+                [ B, (M), T, 6 ] unscaled (x, y, vel, yaw, acc, yawvel) in the agent frame, used for the collision losses
+            sample_weight : tensor
+                [ B*M ] per-sample weight on the collision losses (e.g. by diffusion noise level)
         '''
-        
-        # (B, M, T, transition_dim) -> (B*M, T, transition_dim) -> (B*M, 1, T, transition_dim)
-        B, M, T, _ = pred.shape
-        x_loss = pred.view(B*M, T, -1).unsqueeze(1)
-
-        if data_batch != {}:
-            agent_collision_loss = self.agent_collision_loss_fn(x_loss, data_batch)
-            map_collision_loss = self.map_collision_loss_fn(x_loss, data_batch)
-            agent_collision_loss_mean = torch.mean(agent_collision_loss)
-            map_collision_loss_mean = torch.mean(map_collision_loss)
-            loss_info = {'collision_loss': agent_collision_loss_mean, 'offroad_loss': map_collision_loss_mean}
-        else:
-            loss_info = {}
         loss = self._loss(pred, targ)
         weighted_loss = (loss * self.weights).mean()
-        # a0_loss = (loss[..., 0, -self.action_dim:] / self.weights[0, -self.action_dim:]).mean()
-        
+        a0_loss = (loss[..., 0, -self.action_dim:] / self.weights[0, -self.action_dim:]).mean()
+        loss_info = {'a0_loss': a0_loss}
+
+        if coll_traj is None or not data_batch:
+            return weighted_loss, loss_info
+
+        # (B, M, T, D) -> (B*M, 1, T, D); clone since AgentCollisionLoss detaches stationary agents in place
+        T = coll_traj.size(-2)
+        x_coll = coll_traj.reshape(-1, T, coll_traj.size(-1)).unsqueeze(1).clone()
+
+        def reduce(per_agent):
+            # per_agent : (B*M, 1)
+            if sample_weight is not None:
+                per_agent = per_agent * sample_weight.view(-1, 1)
+            return per_agent.mean()
+
+        loss_info['collision_loss'] = reduce(self.agent_collision_loss_fn(x_coll, data_batch))
+        if data_batch.get('drivable_map') is not None:
+            loss_info['offroad_loss'] = reduce(self.map_collision_loss_fn(x_coll, data_batch))
+
         return weighted_loss, loss_info
     
     def _loss(self, pred, targ):

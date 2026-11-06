@@ -76,6 +76,7 @@ class SpatialPlannerConfig(BehaviorCloningConfig):
         self.bottleneck_temporal_kernel = 3
 
         self.num_eval_samples = 4
+
         # self.loss_weights = {
         #     "diffusion_loss": 1.0,
         # }
@@ -434,6 +435,15 @@ class DiffuserConfig(AlgoConfig):
         self.coordinate = 'agent_centric'  # ['agent_centric', 'scene_centric']
         self.scene_agent_max_neighbor_dist = 30  # used only when data_centric == 'scene' and coordinate == 'agent'
 
+        # goal predictor gRPC service (InternVL + goal head), queried for the goal condition
+        # in training and inference. The GOAL_SERVICE_ADDR env var overrides the address.
+        self.goal_service_address = "localhost:50051"
+        self.goal_service_timeout = 120.0  # seconds per request
+        # JSONL file that gets the ego's target trajectory and the service's goal per sample, None to
+        # disable. The GOAL_LOG_PATH env var overrides it.
+        self.goal_log_path = "goal_log.jsonl"
+        self.goal_cond_dim = 64  # size of the goal feature in the diffuser conditioning
+
         ## model
         self.map_encoder_model_arch = "resnet18"
         self.diffuser_model_arch = "TemporalMapUnet"
@@ -471,13 +481,13 @@ class DiffuserConfig(AlgoConfig):
 
         #
         # Exponential moving average
-        self.use_ema = False
+        self.use_ema = True
         self.ema_step = 1  # 10
         self.ema_decay = 0.995
         self.ema_start_step = 4000  # 2000 -- smaller batch size for real-world data
 
-        # ['concat']
-        self.diffuser_building_block = 'concat'
+        # ['concat', 'film'] -- 'film' applies the conditioning as a per-channel scale and shift
+        self.diffuser_building_block = 'film'
 
         self.action_loss_only = False
 
@@ -492,6 +502,8 @@ class DiffuserConfig(AlgoConfig):
         # [0, 1] OG paper ablates 0.1-0.5, but 0.1-0.3 is their best
         self.conditioning_drop_map_p = 0.0
         self.conditioning_drop_neighbor_p = 0.0
+        # likelihood of replacing the goal with the learned null goal (0.1-0.2 if using classifier-free guidance)
+        self.conditioning_drop_goal_p = 0.0
 
         # value to fill in when condition is "dropped". Should not just be 0 -- the model
         #   should "know" data is missing, not just think there are e.g. no obstacles in the map.
@@ -511,6 +523,8 @@ class DiffuserConfig(AlgoConfig):
         self.history_num_frames = 30  # param to control the number of time steps to use for history
         self.history_num_frames_ego = self.history_num_frames
         self.history_num_frames_agents = self.history_num_frames
+        # evenly spaced history frames (current one included) given to the raster encoder
+        self.hist_encoder_num_frames = 8
 
         self.future_num_frames = self.horizon
         self.step_time = 0.1
@@ -527,8 +541,8 @@ class DiffuserConfig(AlgoConfig):
         self.dynamics.max_speed = 40.0  # roughly 90mph
 
         self.loss_weights.diffusion_loss = 1.0
-        self.loss_weights.collision_loss = 0.0  # 0.05
-        self.loss_weights.offroad_loss = 0.0  # 0.1
+        self.loss_weights.collision_loss = 0.05  # only used with loss_type 'l2_with_agent_collision_and_map_collision'
+        self.loss_weights.offroad_loss = 0.1
         self.loss_weights.history_reconstruction_loss = 0.0
 
         self.loss_decay_rates = {'collision_decay_rate': 0.9, 'offroad_decay_rate': 0.9}

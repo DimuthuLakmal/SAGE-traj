@@ -779,6 +779,8 @@ def _load_remaining_policy_weights(
 
     for k, v in ckpt_state_dict.items():
 
+        print(k)
+
         # 1. Skip modules that are already loaded separately
         if any(k.startswith(prefix) for prefix in ignore_prefixes):
             skipped_by_prefix.append(k)
@@ -815,7 +817,7 @@ def _load_remaining_policy_weights(
 
 class Diffuser(PolicyComposer):
     """Diffuser"""
-    def get_policy(self, policy=None, policy_wrapper=True, data_cache_dir=None, load_mllm_goal_predictor=False):
+    def get_policy(self, policy=None, policy_wrapper=True, data_cache_dir=None):
         if policy is not None:
             assert isinstance(policy, DiffuserTrafficModel)
             policy_cfg = None
@@ -828,38 +830,17 @@ class Diffuser(PolicyComposer):
             )
             policy_cfg = get_experiment_config_from_file(policy_config_path)
 
+            # The goal predictor is served over gRPC (tbsim/utils/goal_service), so nothing to load for it here
             policy = DiffuserTrafficModel(algo_config=policy_cfg.algo, modality_shapes={"image": (3, 224, 224)}, registered_name=policy_cfg["registered_name"], data_cache_dir=data_cache_dir)
-            
-            from tbsim.utils.planning_utils import load_goal_predictor
-            policy_config = get_registered_experiment_config('trajdata_nusc_spatial_planner')
-
-            if not load_mllm_goal_predictor:
-                policy_config.algo.name='bits_spatial_planner'
-                spatial_planner = load_goal_predictor(
-                    cfg=policy_config,
-                    checkpoint_path='/data/gpfs/projects/punim2030/ctg/test/run289/iter60000.ckpt'
-                )
-            else:
-                spatial_planner = load_goal_predictor(
-                    cfg=policy_config,
-                    checkpoint_path='/data/gpfs/projects/punim2030/ctg/test/run332/checkpoints/iter50000.ckpt'
-                )
-            
-            policy.set_policy(spatial_planner)
 
             policy = _load_remaining_policy_weights(
                         policy=policy,
                         checkpoint_path=policy_ckpt_path,
                         device=self.device,
                         ignore_prefixes=[
-                            # Skip the incorrectly nested / unrelated LLM keys
-                            "nets.policy.goal_cvae.nets.policy.llm_model.",
-
-                            # Optional: skip the full goal_cvae policy if it has already been loaded through spatial_planner
-                            # "nets.policy.goal_cvae.",
-
-                            # Optional: skip direct LLM keys if they exist in the main checkpoint
-                            # "nets.policy.llm_model.",
+                            # In-process goal predictor weights in checkpoints from before the gRPC service
+                            "nets.policy.goal_cvae.spatial_planner",
+                            "ema_policy.goal_cvae.spatial_planner",
                         ],
                     )
 

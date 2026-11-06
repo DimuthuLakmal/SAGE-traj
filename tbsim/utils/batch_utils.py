@@ -151,8 +151,8 @@ class L5BatchUtils(BatchUtils):
 class trajdataBatchUtils(BatchUtils):
     """Batch utils for trajdata"""
     @staticmethod
-    def parse_batch(data_batch, llm_config=None):
-        return av_utils.parse_trajdata_batch(data_batch, llm_config=llm_config)
+    def parse_batch(data_batch, iter_i=0):
+        return av_utils.parse_trajdata_batch(data_batch)
 
     @staticmethod
     def batch_to_raw_all_agents(data_batch, step_time):
