@@ -244,7 +244,7 @@ export DIFF_CKPT_KEY=iter100000.ckpt
 
 To run closed-loop simulation without training, download our trained diffusion checkpoint:
 
-- **Pretrained SAGE-Traj checkpoint:** `<GOOGLE_DRIVE_LINK_TO_SAGE_TRAJ_CHECKPOINT>`
+- **Pretrained SAGE-Traj checkpoint:** `https://drive.google.com/drive/folders/1YIUcZAsxfRCGJ0b7N7gRaffcRRLANzUb?usp=sharing`
 
 The download contains the training `config.json` and the checkpoint file. Keep them in this layout:
 
